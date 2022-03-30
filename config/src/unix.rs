@@ -9,7 +9,7 @@ pub struct UnixDomain {
     /// all types of domain in the configuration file.
     pub name: String,
 
-    /// The path to the socket.  If unspecified, a resonable default
+    /// The path to the socket.  If unspecified, a reasonable default
     /// value will be computed.
     pub socket_path: Option<PathBuf>,
 

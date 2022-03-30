@@ -40,7 +40,7 @@ The key event has a number of fields:
 * `raw_key` represents the key press prior to any keymapping/composition events.
   If `raw_key` would be the same as `key` then `raw_key` will be printed as `NONE`.
 * `raw_modifiers` represents the state of the modifier keys prior to any keymapping
-  or composition effects.  For example, typeing `l` with `SHIFT` held down produces
+  or composition effects.  For example, typing `l` with `SHIFT` held down produces
   `raw_modifiers: SHIFT`.
 * `raw_code` is the hardware-and-or-windowing-system-dependent raw keycode value
   associated with the key press.  This generally represents the physical location

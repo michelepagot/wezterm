@@ -31,7 +31,7 @@ applied to the terminal display using the following rules:
 * If DEC line drawing mode is active, graphemes `j-n`, `q`, `t-x` are translated
   to equivalent line drawing graphemes and processing continues.
 * If prior output/actions require it, the cursor position may be moved to a new line
-  and the terminal display may be scrolled to make accomodate it.
+  and the terminal display may be scrolled to make accommodate it.
 * An appropriate number of cells, starting at the current cursor position,
   are allocated based on the column width of the current grapheme and are assigned
   to the grapheme.  The current current graphics rendition state (such as colors
@@ -94,7 +94,7 @@ have an 8-bit representation as well as a multi-codepoint 7-bit escape sequence.
 
 The 8-bit representation is recognized if the 8-bit value is treated as a
 unicode code point and encoded as a multi-byte UTF-8 sequence.  Sending the
-8-bit binary value will not be recognized as intended, as those bitsequences
+8-bit binary value will not be recognized as intended, as those bit sequences
 are passing through a UTF-8 decoder.
 
 The table below lists the 7-bit `C1` sequence (which is preferred) as well as the

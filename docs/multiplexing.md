@@ -113,7 +113,7 @@ return {
       -- The name; must be unique amongst all domains
       name = "unix",
 
-      -- The path to the socket.  If unspecified, a resonable default
+      -- The path to the socket.  If unspecified, a reasonable default
       -- value will be computed.
 
       -- socket_path = "/some/path",
