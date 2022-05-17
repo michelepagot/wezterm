@@ -1,4 +1,4 @@
-use crate::color::RgbColor;
+use crate::color::{RgbColor, SrgbaTuple};
 pub use crate::hyperlink::Hyperlink;
 use crate::{bail, ensure, Result};
 use bitflags::bitflags;
@@ -9,9 +9,9 @@ use std::collections::HashMap;
 use std::fmt::{Display, Error as FmtError, Formatter, Result as FmtResult};
 use std::str;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ColorOrQuery {
-    Color(RgbColor),
+    Color(SrgbaTuple),
     Query,
 }
 
@@ -24,7 +24,7 @@ impl Display for ColorOrQuery {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum OperatingSystemCommand {
     SetIconNameAndWindowTitle(String),
     SetWindowTitle(String),
@@ -63,7 +63,7 @@ pub enum DynamicColorNumber {
     HighlightForegroundColor = 19,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ChangeColorPair {
     pub palette_index: u8,
     pub color: ColorOrQuery,
@@ -204,7 +204,8 @@ impl OperatingSystemCommand {
             } else {
                 ColorOrQuery::Color(
                     RgbColor::from_named_or_rgb_string(spec)
-                        .ok_or_else(|| format!("invalid color spec {:?}", spec))?,
+                        .ok_or_else(|| format!("invalid color spec {:?}", spec))?
+                        .into(),
                 )
             };
 
@@ -235,7 +236,8 @@ impl OperatingSystemCommand {
                 let spec = str::from_utf8(spec)?;
                 colors.push(ColorOrQuery::Color(
                     RgbColor::from_named_or_rgb_string(spec)
-                        .ok_or_else(|| format!("invalid color spec {:?}", spec))?,
+                        .ok_or_else(|| format!("invalid color spec {:?}", spec))?
+                        .into(),
                 ));
             }
         }
@@ -272,10 +274,13 @@ impl OperatingSystemCommand {
 
         macro_rules! single_string {
             ($variant:ident) => {{
-                if osc.len() != 2 {
+                if osc.len() < 2 {
                     bail!("wrong param count");
                 }
-                let s = String::from_utf8(osc[1].to_vec())?;
+                let mut s = String::from_utf8(osc[1].to_vec())?;
+                for i in 2..osc.len() {
+                    s = [s, String::from_utf8(osc[i].to_vec())?].join(";");
+                }
 
                 Ok(OperatingSystemCommand::$variant(s))
             }};
@@ -876,8 +881,12 @@ impl ITermFileData {
         let last = osc.len() - 1;
         for (idx, s) in osc.iter().enumerate().skip(1) {
             let param = if idx == 1 {
-                // skip over File=
-                &s[5..]
+                if s.len() >= 5 {
+                    // skip over File=
+                    &s[5..]
+                } else {
+                    bail!("failed to parse file data; File= not found");
+                }
             } else {
                 s
             };
@@ -1283,16 +1292,18 @@ mod test {
             OperatingSystemCommand::SetIconNameAndWindowTitle("hello \u{1f915}".into())
         );
 
+        assert_eq!(
+            parse(
+                &["0", "hello \u{1f915}", " world"],
+                "\x1b]0;hello \u{1f915}; world\x1b\\"
+            ),
+            OperatingSystemCommand::SetIconNameAndWindowTitle("hello \u{1f915}; world".into())
+        );
+
         // Missing title parameter
         assert_eq!(
             parse(&["0"], "\x1b]0\x1b\\"),
             OperatingSystemCommand::Unspecified(vec![b"0".to_vec()])
-        );
-
-        // too many params
-        assert_eq!(
-            parse(&["0", "1", "2"], "\x1b]0;1;2\x1b\\"),
-            OperatingSystemCommand::Unspecified(vec![b"0".to_vec(), b"1".to_vec(), b"2".to_vec()])
         );
 
         // parsing legacy sun OSC; why bother? This format is used in response

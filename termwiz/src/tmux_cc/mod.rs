@@ -626,11 +626,11 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
+    use k9::assert_equal as assert_eq;
 
     #[test]
     fn test_parse_line() {
-        let _ = pretty_env_logger::formatted_builder()
+        let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();

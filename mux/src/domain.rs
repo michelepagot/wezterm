@@ -118,7 +118,7 @@ pub trait Domain: Downcast {
     }
 
     /// Re-attach to any tabs that might be pre-existing in this domain
-    async fn attach(&self) -> anyhow::Result<()>;
+    async fn attach(&self, window_id: Option<WindowId>) -> anyhow::Result<()>;
 
     /// Detach all tabs
     fn detach(&self) -> anyhow::Result<()>;
@@ -271,6 +271,18 @@ impl Domain for LocalDomain {
         let pane_id = alloc_pane_id();
         cmd.env("WEZTERM_PANE", pane_id.to_string());
 
+        let command_line = cmd
+            .as_unix_command_line()
+            .unwrap_or_else(|err| format!("error rendering command line: {:?}", err));
+        let command_description = format!(
+            "\"{}\" in domain \"{}\"",
+            if command_line.is_empty() {
+                cmd.get_shell()?
+            } else {
+                command_line
+            },
+            self.name
+        );
         let child = pair.slave.spawn_command(cmd)?;
         log::trace!("spawned: {:?}", child);
 
@@ -284,7 +296,7 @@ impl Domain for LocalDomain {
             Box::new(writer),
         );
         if self.is_conpty() {
-            terminal.set_supress_initial_title_change();
+            terminal.enable_conpty_quirks();
         }
 
         let pane: Rc<dyn Pane> = Rc::new(LocalPane::new(
@@ -293,6 +305,7 @@ impl Domain for LocalDomain {
             child,
             pair.master,
             self.id,
+            command_description,
         ));
 
         let mux = Mux::get().unwrap();
@@ -309,12 +322,12 @@ impl Domain for LocalDomain {
         &self.name
     }
 
-    async fn attach(&self) -> anyhow::Result<()> {
+    async fn attach(&self, _window_id: Option<WindowId>) -> anyhow::Result<()> {
         Ok(())
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        bail!("detach not implemented");
+        bail!("detach not implemented for LocalDomain");
     }
 
     fn state(&self) -> DomainState {

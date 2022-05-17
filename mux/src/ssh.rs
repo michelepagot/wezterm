@@ -656,7 +656,14 @@ impl Domain for RemoteSshDomain {
             writer,
         );
 
-        let pane: Rc<dyn Pane> = Rc::new(LocalPane::new(pane_id, terminal, child, pty, self.id));
+        let pane: Rc<dyn Pane> = Rc::new(LocalPane::new(
+            pane_id,
+            terminal,
+            child,
+            pty,
+            self.id,
+            "RemoteSshDomain".to_string(),
+        ));
         let mux = Mux::get().unwrap();
         mux.add_pane(&pane)?;
 
@@ -671,12 +678,12 @@ impl Domain for RemoteSshDomain {
         &self.name
     }
 
-    async fn attach(&self) -> anyhow::Result<()> {
+    async fn attach(&self, _window_id: Option<crate::WindowId>) -> anyhow::Result<()> {
         Ok(())
     }
 
     fn detach(&self) -> anyhow::Result<()> {
-        bail!("detach not implemented");
+        bail!("detach not implemented for RemoteSshDomain");
     }
 
     fn state(&self) -> DomainState {

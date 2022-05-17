@@ -7,8 +7,11 @@ use crate::font::{
     FreeTypeLoadFlags, FreeTypeLoadTarget, StyleRule, TextStyle,
 };
 use crate::frontend::FrontEndSelection;
-use crate::keyassignment::{KeyAssignment, MouseEventTrigger, SpawnCommand};
+use crate::keyassignment::{
+    KeyAssignment, KeyTable, KeyTableEntry, KeyTables, MouseEventTrigger, SpawnCommand,
+};
 use crate::keys::{Key, LeaderKey, Mouse};
+use crate::lua::make_lua_context;
 use crate::ssh::{SshBackend, SshDomain};
 use crate::tls::{TlsDomainClient, TlsDomainServer};
 use crate::units::{de_pixels, Dimension};
@@ -16,7 +19,7 @@ use crate::unix::UnixDomain;
 use crate::wsl::WslDomain;
 use crate::{
     de_number, de_vec_table, default_config_with_overrides_applied, default_one_point_oh,
-    default_one_point_oh_f64, default_true, make_lua_context, LoadedConfig, CONFIG_DIR,
+    default_one_point_oh_f64, default_true, KeyMapPreference, LoadedConfig, CONFIG_DIR,
     CONFIG_FILE_OVERRIDE, CONFIG_OVERRIDES, CONFIG_SKIP, HOME_DIR,
 };
 use anyhow::Context;
@@ -32,7 +35,7 @@ use std::time::Duration;
 use termwiz::hyperlink;
 use termwiz::surface::CursorShape;
 use wezterm_bidi::ParagraphDirectionHint;
-use wezterm_input_types::{KeyCode, Modifiers, WindowDecorations};
+use wezterm_input_types::{Modifiers, WindowDecorations};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
@@ -125,6 +128,9 @@ pub struct Config {
 
     #[serde(default)]
     pub exit_behavior: ExitBehavior,
+
+    #[serde(default = "default_clean_exits")]
+    pub clean_exit_codes: Vec<u32>,
 
     /// Specifies a map of environment variables that should be set
     /// when spawning commands in the local domain.
@@ -249,8 +255,11 @@ pub struct Config {
     #[serde(default = "default_mux_env_remove", deserialize_with = "de_vec_table")]
     pub mux_env_remove: Vec<String>,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_vec_table")]
     pub keys: Vec<Key>,
+    #[serde(default)]
+    pub key_tables: HashMap<String, Vec<Key>>,
+
     #[serde(
         default = "default_bypass_mouse_reporting_modifiers",
         deserialize_with = "crate::keys::de_modifiers"
@@ -278,13 +287,6 @@ pub struct Config {
 
     #[serde(default)]
     pub daemon_options: DaemonOptions,
-
-    /// If set to true, send the system specific composed key when
-    /// the ALT key is held down.  If set to false
-    /// then send the key with the ALT modifier (this is typically
-    /// encoded as ESC followed by the key).
-    #[serde(default = "default_true")]
-    pub send_composed_key_when_alt_is_pressed: bool,
 
     #[serde(default)]
     pub send_composed_key_when_left_alt_is_pressed: bool,
@@ -351,6 +353,8 @@ pub struct Config {
 
     #[serde(default = "default_true")]
     pub custom_block_glyphs: bool,
+    #[serde(default = "default_true")]
+    pub anti_alias_custom_block_glyphs: bool,
 
     /// Controls the amount of padding to use around the terminal cell area
     #[serde(default)]
@@ -595,6 +599,9 @@ pub struct Config {
     #[serde(default = "default_unicode_version")]
     pub unicode_version: u8,
 
+    #[serde(default)]
+    pub treat_east_asian_ambiguous_width_as_wide: bool,
+
     #[serde(default = "default_true")]
     pub allow_download_protocols: bool,
 
@@ -612,6 +619,12 @@ pub struct Config {
 
     #[serde(default)]
     pub xcursor_size: Option<u32>,
+
+    #[serde(default)]
+    pub key_map_preference: KeyMapPreference,
+
+    #[serde(default)]
+    pub quote_dropped_files: DroppedFileQuoting,
 }
 impl_lua_conversion!(Config);
 
@@ -777,15 +790,42 @@ impl Config {
         Self::default().compute_extra_defaults(None)
     }
 
-    pub fn key_bindings(&self) -> HashMap<(KeyCode, Modifiers), KeyAssignment> {
-        let mut map = HashMap::new();
+    pub fn key_bindings(&self) -> KeyTables {
+        let mut tables = KeyTables::default();
 
         for k in &self.keys {
-            let (key, mods) = k.key.normalize_shift(k.mods);
-            map.insert((key, mods), k.action.clone());
+            let (key, mods) = k
+                .key
+                .key
+                .resolve(self.key_map_preference)
+                .normalize_shift(k.key.mods);
+            tables.default.insert(
+                (key, mods),
+                KeyTableEntry {
+                    action: k.action.clone(),
+                },
+            );
         }
 
-        map
+        for (name, keys) in &self.key_tables {
+            let mut table = KeyTable::default();
+            for k in keys {
+                let (key, mods) = k
+                    .key
+                    .key
+                    .resolve(self.key_map_preference)
+                    .normalize_shift(k.key.mods);
+                table.insert(
+                    (key, mods),
+                    KeyTableEntry {
+                        action: k.action.clone(),
+                    },
+                );
+            }
+            tables.by_name.insert(name.to_string(), table);
+        }
+
+        tables
     }
 
     pub fn mouse_bindings(&self) -> HashMap<(MouseEventTrigger, Modifiers), KeyAssignment> {
@@ -1237,6 +1277,10 @@ fn default_prefer_egl() -> bool {
     !cfg!(windows)
 }
 
+fn default_clean_exits() -> Vec<u32> {
+    vec![]
+}
+
 fn default_inactive_pane_hsb() -> HsbTransform {
     HsbTransform {
         brightness: 0.8,
@@ -1422,5 +1466,49 @@ pub enum ExitBehavior {
 impl Default for ExitBehavior {
     fn default() -> Self {
         ExitBehavior::CloseOnCleanExit
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+pub enum DroppedFileQuoting {
+    /// No quoting is performed, the file name is passed through as-is
+    None,
+    /// Backslash escape only spaces, leaving all other characters as-is
+    SpacesOnly,
+    /// Use POSIX style shell word escaping
+    Posix,
+    /// Use Windows style shell word escaping
+    Windows,
+    /// Always double quote the file name
+    WindowsAlwaysQuoted,
+}
+
+impl Default for DroppedFileQuoting {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Self::Windows
+        } else {
+            Self::SpacesOnly
+        }
+    }
+}
+
+impl DroppedFileQuoting {
+    pub fn escape(self, s: &str) -> String {
+        match self {
+            Self::None => s.to_string(),
+            Self::SpacesOnly => s.replace(" ", "\\ "),
+            // https://docs.rs/shlex/latest/shlex/fn.quote.html
+            Self::Posix => shlex::quote(s).into_owned().to_string(),
+            Self::Windows => {
+                let chars_need_quoting = [' ', '\t', '\n', '\x0b', '\"'];
+                if s.chars().any(|c| chars_need_quoting.contains(&c)) {
+                    format!("\"{}\"", s)
+                } else {
+                    s.to_string()
+                }
+            }
+            Self::WindowsAlwaysQuoted => format!("\"{}\"", s),
+        }
     }
 }

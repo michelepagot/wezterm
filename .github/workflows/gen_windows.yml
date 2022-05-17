@@ -12,13 +12,16 @@ on:
       - "ci/subst-release-info.py"
       - ".github/workflows/pages.yml"
       - ".github/workflows/verify-pages.yml"
+      - ".github/workflows/no-response.yml"
       - ".github/ISSUE_TEMPLATE/*"
       - "**/*.md"
+      - "**/*.markdown"
 
 jobs:
   build:
     runs-on: "windows-latest"
     
+
     steps:
       - name: "checkout repo"
         uses: actions/checkout@v3
@@ -55,7 +58,7 @@ jobs:
         shell: bash
         run: "bash ci/deploy.sh"
       - name: "Upload artifact"
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: "windows"
           path: |

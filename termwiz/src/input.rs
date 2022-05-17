@@ -1276,7 +1276,14 @@ impl InputParser {
                         callback(InputEvent::Paste(pasted));
                         self.state = InputState::Normal;
                     } else {
-                        self.state = InputState::Pasting(self.buf.len() - end_paste.len());
+                        // Advance our offset so that in the case where we receive a paste that
+                        // is spread across N reads of size 8K, we don't need to search for the
+                        // end marker in 8K, 16K, 24K etc. of text until the final buffer is received.
+                        // Ensure that we use saturating math here for the case where the amount
+                        // of buffered data after the begin paste is smaller than the end paste marker
+                        // <https://github.com/wez/wezterm/pull/1832>
+                        self.state =
+                            InputState::Pasting(self.buf.len().saturating_sub(end_paste.len()));
                         return;
                     }
                 }
@@ -1592,5 +1599,20 @@ mod test {
             KeyCode::Function(1).encode(Modifiers::NONE, mode).unwrap(),
             "\x1bOP".to_string()
         );
+    }
+
+    #[test]
+    fn partial_bracketed_paste() {
+        let mut p = InputParser::new();
+
+        let input = b"\x1b[200~1234";
+        let input2 = b"5678\x1b[201~";
+
+        let mut inputs = vec![];
+
+        p.parse(input, |e| inputs.push(e), false);
+        p.parse(input2, |e| inputs.push(e), false);
+
+        assert_eq!(vec![InputEvent::Paste("12345678".to_owned())], inputs)
     }
 }

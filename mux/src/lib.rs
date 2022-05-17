@@ -24,6 +24,7 @@ use std::time::Instant;
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
+use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler};
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
@@ -61,6 +62,15 @@ pub enum MuxNotification {
         alert: wezterm_term::Alert,
     },
     Empty,
+    AssignClipboard {
+        pane_id: PaneId,
+        selection: ClipboardSelection,
+        clipboard: Option<String>,
+    },
+    SaveToDownloads {
+        name: Option<String>,
+        data: Arc<Vec<u8>>,
+    },
 }
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
@@ -566,6 +576,14 @@ impl Mux {
             return Ok(());
         }
 
+        let clipboard: Arc<dyn Clipboard> = Arc::new(MuxClipboard {
+            pane_id: pane.pane_id(),
+        });
+        pane.set_clipboard(&clipboard);
+
+        let downloader: Arc<dyn DownloadHandler> = Arc::new(MuxDownloader {});
+        pane.set_download_handler(&downloader);
+
         self.panes
             .borrow_mut()
             .insert(pane.pane_id(), Rc::clone(pane));
@@ -849,7 +867,7 @@ impl Mux {
             }
         }
 
-        log::error!("domain detached panes: {:?}", dead_panes);
+        log::info!("domain detached panes: {:?}", dead_panes);
         for pane_id in dead_panes {
             self.remove_pane_internal(pane_id);
         }
@@ -861,7 +879,7 @@ impl Mux {
         *self.banner.borrow_mut() = banner;
     }
 
-    fn resolve_spawn_tab_domain(
+    pub fn resolve_spawn_tab_domain(
         &self,
         // TODO: disambiguate with TabId
         pane_id: Option<PaneId>,
@@ -885,9 +903,6 @@ impl Mux {
                 .get_domain_by_name(&name)
                 .ok_or_else(|| anyhow!("domain name {} is invalid", name))?,
         };
-        if domain.state() == DomainState::Detached {
-            anyhow::bail!("Cannot spawn a tab into a Detached domain");
-        }
         Ok(domain)
     }
 
@@ -931,13 +946,17 @@ impl Mux {
         command_dir: Option<String>,
         domain: config::keyassignment::SpawnTabDomain,
     ) -> anyhow::Result<(Rc<dyn Pane>, PtySize)> {
-        let (_pane_domain_id, _window_id, tab_id) = self
+        let (_pane_domain_id, window_id, tab_id) = self
             .resolve_pane_id(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
 
         let domain = self
             .resolve_spawn_tab_domain(Some(pane_id), &domain)
             .context("resolve_spawn_tab_domain")?;
+
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
 
         let current_pane = self
             .get_pane(pane_id)
@@ -1005,6 +1024,10 @@ impl Mux {
             (*window_builder, size)
         };
 
+        if domain.state() == DomainState::Detached {
+            domain.attach(Some(window_id)).await?;
+        }
+
         let cwd = self.resolve_cwd(
             command_dir,
             match current_pane_id {
@@ -1065,5 +1088,39 @@ pub(crate) fn pty_size_to_terminal_size(size: portable_pty::PtySize) -> wezterm_
         physical_cols: size.cols as usize,
         pixel_width: size.pixel_width as usize,
         pixel_height: size.pixel_height as usize,
+    }
+}
+
+struct MuxClipboard {
+    pane_id: PaneId,
+}
+
+impl Clipboard for MuxClipboard {
+    fn set_contents(
+        &self,
+        selection: ClipboardSelection,
+        clipboard: Option<String>,
+    ) -> anyhow::Result<()> {
+        let mux =
+            Mux::get().ok_or_else(|| anyhow::anyhow!("MuxClipboard::set_contents: no Mux?"))?;
+        mux.notify(MuxNotification::AssignClipboard {
+            pane_id: self.pane_id,
+            selection,
+            clipboard,
+        });
+        Ok(())
+    }
+}
+
+struct MuxDownloader {}
+
+impl wezterm_term::DownloadHandler for MuxDownloader {
+    fn save_to_downloads(&self, name: Option<String>, data: Vec<u8>) {
+        if let Some(mux) = Mux::get() {
+            mux.notify(MuxNotification::SaveToDownloads {
+                name,
+                data: Arc::new(data),
+            });
+        }
     }
 }

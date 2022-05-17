@@ -1,8 +1,9 @@
 use async_trait::async_trait;
 use bitflags::bitflags;
-use config::ConfigHandle;
+use config::{ConfigHandle, Dimension, GeometryOrigin};
 use promise::Future;
 use std::any::Any;
+use std::path::PathBuf;
 use std::rc::Rc;
 use thiserror::Error;
 pub mod bitmaps;
@@ -51,8 +52,7 @@ pub struct Dimensions {
     pub dpi: usize,
 }
 
-pub type Length = euclid::Length<isize, PixelUnit>;
-pub type LengthF = euclid::Length<f32, PixelUnit>;
+pub type ULength = euclid::Length<usize, PixelUnit>;
 pub type Rect = euclid::Rect<isize, PixelUnit>;
 pub type RectF = euclid::Rect<f32, PixelUnit>;
 pub type Size = euclid::Size2D<isize, PixelUnit>;
@@ -176,6 +176,12 @@ pub enum WindowEvent {
     AppearanceChanged(Appearance),
 
     Notification(Box<dyn Any + Send + Sync>),
+
+    // Called when the files are being dragged into the window
+    DraggedFile(Vec<PathBuf>),
+
+    // Called when the files are dropped into the window
+    DroppedFile(Vec<PathBuf>),
 }
 
 pub struct WindowEventSender {
@@ -299,4 +305,15 @@ pub trait WindowOps {
     ) -> anyhow::Result<Option<os::parameters::Parameters>> {
         Ok(None)
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RequestedWindowGeometry {
+    pub width: Dimension,
+    pub height: Dimension,
+    pub x: Option<Dimension>,
+    pub y: Option<Dimension>,
+    /// Specifies basis for evaluating x/y coords.
+    /// Also applies to width/height when computing % based dimensions
+    pub origin: GeometryOrigin,
 }

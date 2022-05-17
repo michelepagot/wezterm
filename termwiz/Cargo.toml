@@ -1,7 +1,7 @@
 [package]
 authors = ["Wez Furlong"]
 name = "termwiz"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2018"
 repository = "https://github.com/wez/wezterm"
 description = "Terminal Wizardry for Unix and Windows"
@@ -25,9 +25,10 @@ libc = "0.2"
 log = "0.4"
 memmem = "0.1"
 num-traits = "0.2"
-ordered-float = "2.10"
+ordered-float = "3.0"
 pest = "2.1"
 pest_derive = "2.1"
+phf = "0.10"
 regex = "1"
 semver = "0.11"
 serde = {version="1.0", features = ["rc", "derive"], optional=true}
@@ -37,8 +38,8 @@ thiserror = "1.0"
 unicode-segmentation = "1.8"
 ucd-trie = "0.1"
 vtparse = { version="0.6", path="../vtparse" }
-wezterm-bidi = { path = "../bidi" }
-wezterm-color-types = { path = "../color-types" }
+wezterm-bidi = { path = "../bidi", version="0.1" }
+wezterm-color-types = { path = "../color-types", version="0.1" }
 
 [features]
 widgets = ["cassowary", "fnv"]
@@ -48,8 +49,8 @@ docs = ["widgets", "use_serde"]
 
 [dev-dependencies]
 varbincode = "0.1"
-pretty_assertions = "0.6"
-pretty_env_logger = "0.4"
+k9 = "0.11"
+env_logger = "0.9"
 
 [dependencies.num-derive]
 features = ["full-syntax"]
@@ -58,6 +59,8 @@ version = "0.3"
 [target."cfg(unix)".dependencies]
 signal-hook = "0.1"
 termios = "0.3"
+nix = "0.24"
+
 [target."cfg(windows)".dependencies.winapi]
 features = [
     "winbase",
@@ -68,6 +71,8 @@ features = [
     "handleapi",
     "fileapi",
     "synchapi",
+    "memoryapi",
+    "winnt",
 ]
 version = "0.3"
 

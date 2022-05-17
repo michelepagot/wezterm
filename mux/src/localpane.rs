@@ -56,6 +56,7 @@ pub struct LocalPane {
     domain_id: DomainId,
     tmux_domain: RefCell<Option<Arc<TmuxDomainState>>>,
     proc_list: RefCell<Option<CachedProcInfo>>,
+    command_description: String,
 }
 
 #[async_trait(?Send)]
@@ -142,9 +143,10 @@ impl Pane for LocalPane {
         let mut proc = self.process.borrow_mut();
         let mut notify = None;
 
-        const EXIT_BEHAVIOR: &str = "\x1b]8;;https://wezfurlong.org/wezterm/\
-                                     config/lua/config/exit_behavior.html\
-                                     \x1b\\exit_behavior\x1b]8;;\x1b\\";
+        const EXIT_BEHAVIOR: &str = "This message is shown because \
+            \x1b]8;;https://wezfurlong.org/wezterm/\
+            config/lua/config/exit_behavior.html\
+            \x1b\\exit_behavior\x1b]8;;\x1b\\";
 
         match &mut *proc {
             ProcessState::Running {
@@ -157,12 +159,22 @@ impl Pane for LocalPane {
                     Err(TryRecvError::Empty) => None,
                     _ => Some(ExitStatus::with_exit_code(1)),
                 };
+
                 if let Some(status) = status {
-                    match (configuration().exit_behavior, status.success(), killed) {
+                    let success = match status.success() {
+                        true => true,
+                        false => configuration()
+                            .clean_exit_codes
+                            .contains(&status.exit_code()),
+                    };
+
+                    match (configuration().exit_behavior, success, killed) {
                         (ExitBehavior::Close, _, _) => *proc = ProcessState::Dead,
                         (ExitBehavior::CloseOnCleanExit, false, false) => {
                             notify = Some(format!(
-                                "\r\n[Process didn't exit cleanly. ({}=\"CloseOnCleanExit\")]\r\n",
+                                "\r\n⚠️  Process {} didn't exit cleanly\r\n{}.\r\n{}=\"CloseOnCleanExit\"\r\n",
+                                self.command_description,
+                                status,
                                 EXIT_BEHAVIOR
                             ));
                             *proc = ProcessState::DeadPendingClose { killed: false }
@@ -171,12 +183,14 @@ impl Pane for LocalPane {
                         (ExitBehavior::Hold, success, false) => {
                             if success {
                                 notify = Some(format!(
-                                    "\r\n[Process completed. ({}=\"Hold\")]\r\n",
-                                    EXIT_BEHAVIOR
+                                    "\r\n👍 Process {} completed.\r\n{}=\"Hold\"\r\n",
+                                    self.command_description, EXIT_BEHAVIOR
                                 ));
                             } else {
                                 notify = Some(format!(
-                                    "\r\n[Process didn't exit cleanly. ({}=\"Hold\")]\r\n",
+                                    "\r\n⚠️  Process {} didn't exit cleanly\r\n{}.\r\n{}=\"Hold\"\r\n",
+                                    self.command_description,
+                                    status,
                                     EXIT_BEHAVIOR
                                 ));
                             }
@@ -355,6 +369,15 @@ impl Pane for LocalPane {
             .get_current_dir()
             .cloned()
             .or_else(|| self.divine_current_working_dir())
+    }
+
+    fn get_foreground_process_info(&self) -> Option<LocalProcessInfo> {
+        #[cfg(unix)]
+        if let Some(pid) = self.pty.borrow().process_group_leader() {
+            return LocalProcessInfo::with_root_pid(pid as u32);
+        }
+
+        self.divine_foreground_process()
     }
 
     fn get_foreground_process_name(&self) -> Option<String> {
@@ -550,7 +573,7 @@ impl Pane for LocalPane {
             }
         }
 
-        for (idx, line) in screen.lines.iter().enumerate() {
+        screen.for_each_phys_line(|idx, line| {
             let stable_row = screen.phys_to_stable_row_index(idx);
 
             let mut wrapped = false;
@@ -593,7 +616,7 @@ impl Pane for LocalPane {
                     coords.clear();
                 }
             }
-        }
+        });
 
         collect_matches(
             &mut results,
@@ -732,6 +755,7 @@ impl LocalPane {
         process: Box<dyn Child + Send>,
         pty: Box<dyn MasterPty>,
         domain_id: DomainId,
+        command_description: String,
     ) -> Self {
         let (process, signaller, pid) = split_child(process);
 
@@ -753,6 +777,7 @@ impl LocalPane {
             domain_id,
             tmux_domain: RefCell::new(None),
             proc_list: RefCell::new(None),
+            command_description,
         }
     }
 
@@ -784,6 +809,7 @@ impl LocalPane {
                     .unwrap_or(true);
 
             if expired {
+                log::trace!("CachedProcInfo expired, refresh");
                 let root = LocalProcessInfo::with_root_pid(*pid)?;
 
                 // Windows doesn't have any job control or session concept,
@@ -818,6 +844,7 @@ impl LocalPane {
                     foreground,
                     updated: Instant::now(),
                 });
+                log::trace!("CachedProcInfo updated");
             }
 
             return Some(RefMut::map(proc_list, |info| info.as_mut().unwrap()));

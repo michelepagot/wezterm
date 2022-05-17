@@ -5,10 +5,11 @@ use crate::cache::LruCache;
 use crate::colorease::ColorEase;
 use crate::frontend::front_end;
 use crate::glium::texture::SrgbTexture2d;
+use crate::inputmap::InputMap;
 use crate::overlay::{
     confirm_close_pane, confirm_close_tab, confirm_close_window, confirm_quit_program, launcher,
-    start_overlay, start_overlay_pane, CopyOverlay, LauncherArgs, LauncherFlags,
-    QuickSelectOverlay, SearchOverlay,
+    start_overlay, start_overlay_pane, CopyModeParams, CopyOverlay, LauncherArgs, LauncherFlags,
+    QuickSelectOverlay,
 };
 use crate::scripting::guiwin::GuiWin;
 use crate::scripting::pane::PaneObject;
@@ -16,16 +17,17 @@ use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
-use ::wezterm_term::input::MouseButton as TMB;
+use crate::termwindow::keyevent::KeyTableState;
+use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
-    ClipboardCopyDestination, ClipboardPasteSource, InputMap, KeyAssignment, QuickSelectArguments,
+    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, Pattern, QuickSelectArguments,
     SpawnCommand,
 };
 use config::{
-    configuration, AudibleBell, ConfigHandle, DimensionContext, GradientOrientation, TermConfig,
-    WindowCloseConfirmation,
+    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, GradientOrientation,
+    TermConfig, WindowCloseConfirmation,
 };
 use mlua::{FromLua, UserData, UserDataFields};
 use mux::pane::{CloseReason, Pane, PaneId};
@@ -47,6 +49,7 @@ use termwiz::hyperlink::Hyperlink;
 use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::SequenceNo;
 use wezterm_font::FontConfiguration;
+use wezterm_gui_subcommands::GuiPosition;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, StableRowIndex, TerminalConfiguration};
@@ -60,7 +63,6 @@ mod render;
 pub mod resize;
 mod selection;
 pub mod spawn;
-use clipboard::ClipboardHelper;
 use prevcursor::PrevCursorPos;
 use spawn::SpawnWhere;
 
@@ -68,9 +70,14 @@ const ATLAS_SIZE: usize = 128;
 
 lazy_static::lazy_static! {
     static ref WINDOW_CLASS: Mutex<String> = Mutex::new(wezterm_gui_subcommands::DEFAULT_WINDOW_CLASS.to_owned());
+    static ref POSITION: Mutex<Option<GuiPosition>> = Mutex::new(None);
 }
 
 pub const ICON_DATA: &'static [u8] = include_bytes!("../../../assets/icon/terminal.png");
+
+pub fn set_window_position(pos: GuiPosition) {
+    POSITION.lock().unwrap().replace(pos);
+}
 
 pub fn set_window_class(cls: &str) {
     *WINDOW_CLASS.lock().unwrap() = cls.to_owned();
@@ -78,6 +85,12 @@ pub fn set_window_class(cls: &str) {
 
 pub fn get_window_class() -> String {
     WINDOW_CLASS.lock().unwrap().clone()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MouseCapture {
+    UI,
+    TerminalPane(PaneId),
 }
 
 /// Type used together with Window::notify to do something in the
@@ -146,7 +159,12 @@ pub struct SemanticZoneCache {
     zones: Vec<StableRowIndex>,
 }
 
-#[derive(Default, Clone)]
+pub struct OverlayState {
+    pub pane: Rc<dyn Pane>,
+    key_table_state: KeyTableState,
+}
+
+#[derive(Default)]
 pub struct PaneState {
     /// If is_some(), the top row of the visible screen.
     /// Otherwise, the viewport is at the bottom of the
@@ -156,10 +174,10 @@ pub struct PaneState {
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
-    pub overlay: Option<Rc<dyn Pane>>,
+    pub overlay: Option<OverlayState>,
 
     bell_start: Option<Instant>,
-    pub mouse_terminal_coords: Option<(usize, StableRowIndex)>,
+    pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -255,15 +273,30 @@ impl UserData for PaneInformation {
                 None => Ok("".to_string()),
             }
         });
+        fields.add_field_method_get("domain_name", |_, this| {
+            let mut name = None;
+            if let Some(mux) = Mux::get() {
+                if let Some(pane) = mux.get_pane(this.pane_id) {
+                    let domain_id = pane.domain_id();
+                    name = mux
+                        .get_domain(domain_id)
+                        .map(|dom| dom.domain_name().to_string());
+                }
+            }
+            match name {
+                Some(name) => Ok(name),
+                None => Ok("".to_string()),
+            }
+        });
     }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct TabState {
     /// If is_some(), rather than display the actual tab
     /// contents, we're overlaying a little internal application
     /// tab.  We'll also route input to it.
-    pub overlay: Option<Rc<dyn Pane>>,
+    pub overlay: Option<OverlayState>,
 }
 
 /// Manages the state/queue of lua based event handlers.
@@ -295,12 +328,14 @@ pub struct TermWindow {
     /// Terminal dimensions
     terminal_size: PtySize,
     pub mux_window_id: MuxWindowId,
+    pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
     render_state: Option<RenderState>,
     input_map: InputMap,
     /// If is_some, the LEADER modifier is active until the specified instant.
     leader_is_down: Option<std::time::Instant>,
     dead_key_status: DeadKeyStatus,
+    key_table_state: KeyTableState,
     show_tab_bar: bool,
     show_scroll_bar: bool,
     tab_bar: TabBarState,
@@ -323,6 +358,7 @@ pub struct TermWindow {
     window_background: Option<Arc<ImageData>>,
 
     current_mouse_buttons: Vec<MousePress>,
+    current_mouse_capture: Option<MouseCapture>,
 
     /// Keeps track of double and triple clicks
     last_mouse_click: Option<LastMouseClick>,
@@ -419,6 +455,7 @@ impl TermWindow {
         if self.focused.is_none() {
             self.last_mouse_click = None;
             self.current_mouse_buttons.clear();
+            self.current_mouse_capture = None;
             self.is_click_to_focus_window = false;
 
             for state in self.pane_state.borrow_mut().values_mut() {
@@ -715,6 +752,7 @@ impl TermWindow {
             palette: None,
             focused: None,
             mux_window_id,
+            mux_window_id_for_subscriptions: Arc::new(Mutex::new(mux_window_id)),
             fonts: Rc::clone(&fontconfig),
             render_metrics,
             dimensions,
@@ -737,6 +775,7 @@ impl TermWindow {
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
+            current_mouse_capture: None,
             last_mouse_click: None,
             current_highlight: None,
             shape_cache: RefCell::new(LruCache::new(
@@ -775,16 +814,32 @@ impl TermWindow {
             dragging: None,
             last_ui_item: None,
             is_click_to_focus_window: false,
+            key_table_state: KeyTableState::default(),
         };
 
         let tw = Rc::new(RefCell::new(myself));
         let tw_event = Rc::clone(&tw);
 
+        let (x, y, origin) = POSITION
+            .lock()
+            .unwrap()
+            .take()
+            .map(|pos| (Some(pos.x), Some(pos.y), pos.origin))
+            .unwrap_or((None, None, Default::default()));
+
+        let geometry = RequestedWindowGeometry {
+            width: Dimension::Pixels(dimensions.pixel_width as f32),
+            height: Dimension::Pixels(dimensions.pixel_height as f32),
+            x,
+            y,
+            origin,
+        };
+        log::trace!("{:?}", geometry);
+
         let window = Window::new_window(
             &get_window_class(),
             "wezterm",
-            dimensions.pixel_width,
-            dimensions.pixel_height,
+            geometry,
             Some(&config),
             Rc::clone(&fontconfig),
             move |event, window| {
@@ -798,7 +853,6 @@ impl TermWindow {
         tw.borrow_mut().window.replace(window.clone());
 
         Self::apply_icon(&window)?;
-        Self::setup_clipboard(&window, mux_window_id)?;
 
         let config_subscription = config::subscribe_to_config_reload({
             let window = window.clone();
@@ -894,6 +948,24 @@ impl TermWindow {
                 }
                 Ok(true)
             }
+            WindowEvent::DroppedFile(paths) => {
+                let pane = match self.get_active_pane_or_overlay() {
+                    Some(pane) => pane,
+                    None => return Ok(true),
+                };
+                let paths = paths
+                    .iter()
+                    .map(|path| {
+                        self.config
+                            .quote_dropped_files
+                            .escape(&path.to_string_lossy())
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                pane.trickle_paste(paths)?;
+                Ok(true)
+            }
+            WindowEvent::DraggedFile(_) => Ok(true),
         }
     }
 
@@ -1009,7 +1081,7 @@ impl TermWindow {
                         AudibleBell::Disabled => {}
                     }
 
-                    log::info!("Ding! (this is the bell) in pane {}", pane_id);
+                    log::trace!("Ding! (this is the bell) in pane {}", pane_id);
                     self.emit_window_event("bell", Some(pane_id));
 
                     let mut per_pane = self.pane_state(pane_id);
@@ -1027,6 +1099,12 @@ impl TermWindow {
                     window.invalidate();
                 }
                 MuxNotification::WindowRemoved(_window_id) => {
+                    // Handled by frontend
+                }
+                MuxNotification::AssignClipboard { .. } => {
+                    // Handled by frontend
+                }
+                MuxNotification::SaveToDownloads { .. } => {
                     // Handled by frontend
                 }
                 MuxNotification::PaneAdded(_)
@@ -1054,6 +1132,7 @@ impl TermWindow {
             }
             TermWindowNotif::SwitchToMuxWindow(mux_window_id) => {
                 self.mux_window_id = mux_window_id;
+                *self.mux_window_id_for_subscriptions.lock().unwrap() = mux_window_id;
                 self.pane_state.borrow_mut().clear();
                 self.tab_state.borrow_mut().clear();
                 self.current_highlight.take();
@@ -1099,7 +1178,12 @@ impl TermWindow {
         };
 
         let tab_id = tab.tab_id();
-        if let Some(tab_overlay) = self.tab_state(tab_id).overlay.clone() {
+        if let Some(tab_overlay) = self
+            .tab_state(tab_id)
+            .overlay
+            .as_ref()
+            .map(|overlay| overlay.pane.clone())
+        {
             return tab_overlay.pane_id() == pane_id;
         }
 
@@ -1141,37 +1225,20 @@ impl TermWindow {
                 let mux = Mux::get().expect("mux is calling us");
                 if mux.get_window(mux_window_id).is_none() {
                     // Something inconsistent: cancel subscription
+                    log::error!(
+                        "PaneOutput: wanted mux_window_id={} from mux, but \
+                         was not found, cancel mux subscription",
+                        mux_window_id
+                    );
                     return false;
                 }
                 let _ = pane_id;
             }
-            MuxNotification::PaneAdded(pane_id) => {
+            MuxNotification::PaneAdded(_pane_id) => {
                 // If some other client spawns a pane inside this window, this
                 // gives us an opportunity to attach it to the clipboard.
                 let mux = Mux::get().expect("mux is calling us");
-                if let Some(mux_window) = mux.get_window(mux_window_id) {
-                    for tab in mux_window.iter() {
-                        for pos in tab.iter_panes() {
-                            if pos.pane.pane_id() == pane_id {
-                                let clipboard: Arc<dyn wezterm_term::Clipboard> =
-                                    Arc::new(ClipboardHelper {
-                                        window: window.clone(),
-                                    });
-                                pos.pane.set_clipboard(&clipboard);
-
-                                let downloader: Arc<dyn wezterm_term::DownloadHandler> =
-                                    Arc::new(crate::download::Downloader::new());
-                                pos.pane.set_download_handler(&downloader);
-
-                                break;
-                            }
-                        }
-                    }
-                    return true;
-                } else {
-                    // Something inconsistent: cancel subscription
-                    return false;
-                };
+                return mux.get_window(mux_window_id).is_some();
             }
             MuxNotification::WindowRemoved(window_id)
             | MuxNotification::WindowInvalidated(window_id) => {
@@ -1186,6 +1253,8 @@ impl TermWindow {
                     | Alert::PaletteChanged { .. },
                 ..
             }
+            | MuxNotification::AssignClipboard { .. }
+            | MuxNotification::SaveToDownloads { .. }
             | MuxNotification::PaneRemoved(_)
             | MuxNotification::WindowCreated(_)
             | MuxNotification::ActiveWorkspaceChanged(_)
@@ -1200,10 +1269,11 @@ impl TermWindow {
 
     fn subscribe_to_pane_updates(&self) {
         let window = self.window.clone().expect("window to be valid on startup");
-        let mux_window_id = self.mux_window_id;
+        let mux_window_id = Arc::clone(&self.mux_window_id_for_subscriptions);
         let mux = Mux::get().expect("mux started and running on main thread");
         let dead = Arc::new(AtomicBool::new(false));
         mux.subscribe(move |n| {
+            let mux_window_id = *mux_window_id.lock().unwrap();
             Self::mux_pane_output_event_callback(n, &window, mux_window_id, &dead)
         });
     }
@@ -1335,8 +1405,7 @@ impl TermWindow {
         if dirty.is_empty() {
             return;
         }
-        if pane.downcast_ref::<SearchOverlay>().is_none()
-            && pane.downcast_ref::<CopyOverlay>().is_none()
+        if pane.downcast_ref::<CopyOverlay>().is_none()
             && pane.downcast_ref::<QuickSelectOverlay>().is_none()
         {
             // If any of the changed lines intersect with the
@@ -1356,7 +1425,7 @@ impl TermWindow {
 
             if clear_selection {
                 self.selection(pane.pane_id()).range.take();
-                self.selection(pane.pane_id()).start.take();
+                self.selection(pane.pane_id()).origin.take();
                 self.selection(pane.pane_id()).seqno = pane.get_current_seqno();
             }
         }
@@ -1377,6 +1446,7 @@ impl TermWindow {
             "config was reloaded, overrides: {:?}",
             self.config_overrides
         );
+        self.key_table_state.clear_stack();
         let config = match config::overridden_config(&self.config_overrides) {
             Ok(config) => config,
             Err(err) => {
@@ -1663,8 +1733,12 @@ impl TermWindow {
     fn update_text_cursor(&mut self, pane: &Rc<dyn Pane>) {
         let cursor = pane.get_cursor_position();
         if let Some(win) = self.window.as_ref() {
-            let top = pane.get_dimensions().physical_top + if self.show_tab_bar { -1 } else { 0 };
-
+            let top = pane.get_dimensions().physical_top;
+            let tab_bar_height = if self.show_tab_bar {
+                self.tab_bar_pixel_height().unwrap()
+            } else {
+                0.0
+            };
             let (padding_left, padding_top) = self.padding_left_top();
 
             let r = Rect::new(
@@ -1672,6 +1746,7 @@ impl TermWindow {
                     (cursor.x.max(0) as isize * self.render_metrics.cell_size.width)
                         .add(padding_left as isize),
                     ((cursor.y - top).max(0) as isize * self.render_metrics.cell_size.height)
+                        .add(tab_bar_height as isize)
                         .add(padding_top as isize),
                 ),
                 self.render_metrics.cell_size,
@@ -1800,7 +1875,8 @@ impl TermWindow {
             LauncherFlags::LAUNCH_MENU_ITEMS
                 | LauncherFlags::WORKSPACES
                 | LauncherFlags::DOMAINS
-                | LauncherFlags::KEY_ASSIGNMENTS,
+                | LauncherFlags::KEY_ASSIGNMENTS
+                | LauncherFlags::COMMANDS,
         );
     }
 
@@ -1963,9 +2039,40 @@ impl TermWindow {
     ) -> anyhow::Result<()> {
         use KeyAssignment::*;
 
+        if pane.perform_assignment(assignment) {
+            return Ok(());
+        }
+
         let window = self.window.as_ref().map(|w| w.clone());
 
         match assignment {
+            ActivateKeyTable {
+                name,
+                timeout_milliseconds,
+                replace_current,
+                one_shot,
+            } => {
+                anyhow::ensure!(
+                    self.input_map.has_table(name),
+                    "ActivateKeyTable: no key_table named {}",
+                    name
+                );
+                self.key_table_state.activate(
+                    name,
+                    *timeout_milliseconds,
+                    *replace_current,
+                    *one_shot,
+                );
+                self.update_title();
+            }
+            PopKeyTable => {
+                self.key_table_state.pop();
+                self.update_title();
+            }
+            ClearKeyTableStack => {
+                self.key_table_state.clear_stack();
+                self.update_title();
+            }
             Multiple(actions) => {
                 for a in actions {
                     self.perform_key_assignment(pane, a)?;
@@ -2048,7 +2155,9 @@ impl TermWindow {
             SendKey(key) => {
                 use keyevent::{window_mods_to_termwiz_mods, Key};
                 let mods = window_mods_to_termwiz_mods(key.mods);
-                if let Key::Code(key) = self.win_key_code_to_termwiz_key_code(&key.key) {
+                if let Key::Code(key) = self.win_key_code_to_termwiz_key_code(
+                    &key.key.resolve(self.config.key_map_preference),
+                ) {
                     pane.key_down(key, mods)?;
                 }
             }
@@ -2111,6 +2220,9 @@ impl TermWindow {
             ExtendSelectionToMouseCursor(mode) => {
                 self.extend_selection_at_mouse_cursor(*mode, pane)
             }
+            ClearSelection => {
+                self.clear_selection(pane);
+            }
             StartWindowDrag => {
                 self.window_drag_position = self.current_mouse_event.clone();
             }
@@ -2144,9 +2256,38 @@ impl TermWindow {
                 window.invalidate();
             }
             Search(pattern) => {
-                if let Some(pane) = self.get_active_pane_no_overlay() {
-                    let search = SearchOverlay::with_pane(self, &pane, pattern.clone());
-                    self.assign_overlay_for_pane(pane.pane_id(), search);
+                if let Some(pane) = self.get_active_pane_or_overlay() {
+                    let mut replace_current = false;
+                    if let Some(existing) = pane.downcast_ref::<CopyOverlay>() {
+                        let mut params = existing.get_params();
+                        params.editing_search = true;
+                        if !pattern.is_empty() {
+                            params.pattern = pattern.clone();
+                        }
+                        existing.apply_params(params);
+                        replace_current = true;
+                    } else {
+                        let search = CopyOverlay::with_pane(
+                            self,
+                            &pane,
+                            CopyModeParams {
+                                pattern: pattern.clone(),
+                                editing_search: true,
+                            },
+                        );
+                        self.assign_overlay_for_pane(pane.pane_id(), search);
+                    }
+                    self.pane_state(pane.pane_id())
+                        .overlay
+                        .as_mut()
+                        .map(|overlay| {
+                            overlay.key_table_state.activate(
+                                "search_mode",
+                                None,
+                                replace_current,
+                                false,
+                            );
+                        });
                 }
             }
             QuickSelect => {
@@ -2166,9 +2307,35 @@ impl TermWindow {
                 }
             }
             ActivateCopyMode => {
-                if let Some(pane) = self.get_active_pane_no_overlay() {
-                    let copy = CopyOverlay::with_pane(self, &pane);
-                    self.assign_overlay_for_pane(pane.pane_id(), copy);
+                if let Some(pane) = self.get_active_pane_or_overlay() {
+                    let mut replace_current = false;
+                    if let Some(existing) = pane.downcast_ref::<CopyOverlay>() {
+                        let mut params = existing.get_params();
+                        params.editing_search = false;
+                        existing.apply_params(params);
+                        replace_current = true;
+                    } else {
+                        let copy = CopyOverlay::with_pane(
+                            self,
+                            &pane,
+                            CopyModeParams {
+                                pattern: Pattern::default(),
+                                editing_search: false,
+                            },
+                        );
+                        self.assign_overlay_for_pane(pane.pane_id(), copy);
+                    }
+                    self.pane_state(pane.pane_id())
+                        .overlay
+                        .as_mut()
+                        .map(|overlay| {
+                            overlay.key_table_state.activate(
+                                "copy_mode",
+                                None,
+                                replace_current,
+                                false,
+                            );
+                        });
                 }
             }
             AdjustPaneSize(direction, amount) => {
@@ -2252,9 +2419,6 @@ impl TermWindow {
                     let size = self.terminal_size;
                     let term_config = Arc::new(TermConfig::with_config(self.config.clone()));
                     let src_window_id = self.mux_window_id;
-                    let clipboard = ClipboardHelper {
-                        window: self.window.as_ref().unwrap().clone(),
-                    };
 
                     promise::spawn::spawn(async move {
                         if let Err(err) = Self::spawn_command_internal(
@@ -2262,7 +2426,6 @@ impl TermWindow {
                             SpawnWhere::NewWindow,
                             size,
                             src_window_id,
-                            clipboard,
                             term_config,
                         )
                         .await
@@ -2276,6 +2439,42 @@ impl TermWindow {
                 } else {
                     switcher.do_switch();
                 }
+            }
+            DetachDomain(domain) => {
+                let domain = Mux::get()
+                    .expect("running on GUI thread")
+                    .resolve_spawn_tab_domain(Some(pane.pane_id()), domain)?;
+                domain.detach()?;
+            }
+            AttachDomain(domain) => {
+                let window = self.mux_window_id;
+                let domain = domain.to_string();
+
+                promise::spawn::spawn(async move {
+                    let mux = Mux::get().unwrap();
+                    let domain = mux
+                        .get_domain_by_name(&domain)
+                        .ok_or_else(|| anyhow!("{} is not a valid domain name", domain))?;
+                    domain.attach(Some(window)).await?;
+
+                    let have_panes_in_domain = mux
+                        .iter_panes()
+                        .iter()
+                        .any(|p| p.domain_id() == domain.domain_id());
+
+                    if !have_panes_in_domain {
+                        let config = config::configuration();
+                        let _tab = domain
+                            .spawn(config.initial_size(), None, None, window)
+                            .await?;
+                    }
+
+                    Result::<(), anyhow::Error>::Ok(())
+                })
+                .detach();
+            }
+            CopyMode(_) => {
+                // NOP here; handled by the overlay directly
             }
         };
         Ok(())
@@ -2422,10 +2621,6 @@ impl TermWindow {
         })
     }
 
-    pub fn selection(&self, pane_id: PaneId) -> RefMut<Selection> {
-        RefMut::map(self.pane_state(pane_id), |state| &mut state.selection)
-    }
-
     pub fn get_viewport(&self, pane_id: PaneId) -> Option<StableRowIndex> {
         self.pane_state(pane_id).viewport
     }
@@ -2455,11 +2650,9 @@ impl TermWindow {
             // This is a bit gross.  If we add other overlays that need this information,
             // this should get extracted out into a trait
             if let Some(overlay) = state.overlay.as_ref() {
-                if let Some(search_overlay) = overlay.downcast_ref::<SearchOverlay>() {
-                    search_overlay.viewport_changed(pos);
-                } else if let Some(copy) = overlay.downcast_ref::<CopyOverlay>() {
+                if let Some(copy) = overlay.pane.downcast_ref::<CopyOverlay>() {
                     copy.viewport_changed(pos);
-                } else if let Some(qs) = overlay.downcast_ref::<QuickSelectOverlay>() {
+                } else if let Some(qs) = overlay.pane.downcast_ref::<QuickSelectOverlay>() {
                     qs.viewport_changed(pos);
                 }
             }
@@ -2503,14 +2696,20 @@ impl TermWindow {
 
         let tab_id = tab.tab_id();
 
-        if let Some(tab_overlay) = self.tab_state(tab_id).overlay.clone() {
+        if let Some(tab_overlay) = self
+            .tab_state(tab_id)
+            .overlay
+            .as_ref()
+            .map(|overlay| overlay.pane.clone())
+        {
             Some(tab_overlay)
         } else {
             let pane = tab.get_active_pane()?;
             let pane_id = pane.pane_id();
             self.pane_state(pane_id)
                 .overlay
-                .clone()
+                .as_ref()
+                .map(|overlay| overlay.pane.clone())
                 .or_else(|| Some(pane))
         }
     }
@@ -2524,7 +2723,7 @@ impl TermWindow {
 
         let tab_id = tab.tab_id();
 
-        if let Some(_) = self.tab_state(tab_id).overlay.clone() {
+        if self.tab_state(tab_id).overlay.is_some() {
             vec![]
         } else {
             tab.iter_splits()
@@ -2586,7 +2785,12 @@ impl TermWindow {
     fn get_pos_panes_for_tab(&mut self, tab: &Rc<Tab>) -> Vec<PositionedPane> {
         let tab_id = tab.tab_id();
 
-        if let Some(pane) = self.tab_state(tab_id).overlay.clone() {
+        if let Some(pane) = self
+            .tab_state(tab_id)
+            .overlay
+            .as_ref()
+            .map(|overlay| overlay.pane.clone())
+        {
             let size = tab.get_size();
             vec![PositionedPane {
                 index: 0,
@@ -2604,7 +2808,7 @@ impl TermWindow {
             let mut panes = tab.iter_panes();
             for p in &mut panes {
                 if let Some(overlay) = self.pane_state(p.pane.pane_id()).overlay.as_ref() {
-                    p.pane = Rc::clone(overlay);
+                    p.pane = Rc::clone(&overlay.pane);
                 }
             }
             panes
@@ -2623,15 +2827,19 @@ impl TermWindow {
 
     /// if pane_id.is_none(), removes any overlay for the specified tab.
     /// Otherwise: if the overlay is the specified pane for that tab, remove it.
-    fn cancel_overlay_for_tab(&self, tab_id: TabId, pane_id: Option<PaneId>) {
+    fn cancel_overlay_for_tab(&mut self, tab_id: TabId, pane_id: Option<PaneId>) {
         if pane_id.is_some() {
-            let current = self.tab_state(tab_id).overlay.as_ref().map(|o| o.pane_id());
+            let current = self
+                .tab_state(tab_id)
+                .overlay
+                .as_ref()
+                .map(|o| o.pane.pane_id());
             if current != pane_id {
                 return;
             }
         }
-        if let Some(pane) = self.tab_state(tab_id).overlay.take() {
-            Mux::get().unwrap().remove_pane(pane.pane_id());
+        if let Some(overlay) = self.tab_state(tab_id).overlay.take() {
+            Mux::get().unwrap().remove_pane(overlay.pane.pane_id());
         }
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
@@ -2642,14 +2850,14 @@ impl TermWindow {
         window.notify(TermWindowNotif::CancelOverlayForTab { tab_id, pane_id });
     }
 
-    fn cancel_overlay_for_pane(&self, pane_id: PaneId) {
-        if let Some(pane) = self.pane_state(pane_id).overlay.take() {
+    fn cancel_overlay_for_pane(&mut self, pane_id: PaneId) {
+        if let Some(overlay) = self.pane_state(pane_id).overlay.take() {
             // Ungh, when I built the CopyOverlay, its pane doesn't get
             // added to the mux and instead it reports the overlaid
             // pane id.  Take care to avoid killing ourselves off
             // when closing the CopyOverlay
-            if pane_id != pane.pane_id() {
-                Mux::get().unwrap().remove_pane(pane.pane_id());
+            if pane_id != overlay.pane.pane_id() {
+                Mux::get().unwrap().remove_pane(overlay.pane.pane_id());
             }
         }
         if let Some(window) = self.window.as_ref() {
@@ -2661,22 +2869,21 @@ impl TermWindow {
         window.notify(TermWindowNotif::CancelOverlayForPane(pane_id));
     }
 
-    pub fn assign_overlay_for_pane(&mut self, pane_id: PaneId, overlay: Rc<dyn Pane>) {
-        if let Some(prior) = self.pane_state(pane_id).overlay.replace(overlay) {
-            if pane_id != prior.pane_id() {
-                Mux::get().unwrap().remove_pane(prior.pane_id());
-            }
-        }
+    pub fn assign_overlay_for_pane(&mut self, pane_id: PaneId, pane: Rc<dyn Pane>) {
+        self.cancel_overlay_for_pane(pane_id);
+        self.pane_state(pane_id).overlay.replace(OverlayState {
+            pane,
+            key_table_state: KeyTableState::default(),
+        });
         self.update_title();
     }
 
     pub fn assign_overlay(&mut self, tab_id: TabId, overlay: Rc<dyn Pane>) {
-        let pane_id = overlay.pane_id();
-        if let Some(prior) = self.tab_state(tab_id).overlay.replace(overlay) {
-            if pane_id != prior.pane_id() {
-                Mux::get().unwrap().remove_pane(prior.pane_id());
-            }
-        }
+        self.cancel_overlay_for_tab(tab_id, None);
+        self.tab_state(tab_id).overlay.replace(OverlayState {
+            pane: overlay,
+            key_table_state: KeyTableState::default(),
+        });
         self.update_title();
     }
 }

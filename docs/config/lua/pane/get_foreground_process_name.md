@@ -14,7 +14,7 @@ This method has some restrictions and caveats:
 
 If the path is not known then this method returns `nil`.
 
-This example sets the right status are to the executable path:
+This example sets the right status to the executable path:
 
 ```lua
 local wezterm = require 'wezterm'
@@ -33,3 +33,5 @@ end)
 return {
 }
 ```
+
+See also: [get_foreground_process_info](get_foreground_process_info.md)

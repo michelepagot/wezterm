@@ -5,13 +5,13 @@ use crate::connection::ConnectionOps;
 use crate::os::wayland::connection::WaylandConnection;
 use crate::os::x11::keyboard::Keyboard;
 use crate::{
-    Clipboard, Connection, Dimensions, MouseCursor, Point, ScreenPoint, Window, WindowEvent,
-    WindowEventSender, WindowKeyEvent, WindowOps, WindowState,
+    Clipboard, Connection, Dimensions, MouseCursor, Point, RequestedWindowGeometry, ScreenPoint,
+    Window, WindowEvent, WindowEventSender, WindowKeyEvent, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, Context};
 use async_io::Timer;
 use async_trait::async_trait;
-use config::ConfigHandle;
+use config::{ConfigHandle, DimensionContext};
 use filedescriptor::FileDescriptor;
 use promise::{Future, Promise};
 use raw_window_handle::unix::WaylandHandle;
@@ -131,6 +131,8 @@ pub struct WaylandWindowInner {
     window_state: WindowState,
     last_mouse_coords: Point,
     mouse_buttons: MouseButtons,
+    hscroll_remainder: f64,
+    vscroll_remainder: f64,
     modifiers: Modifiers,
     key_repeat: Option<Arc<Mutex<KeyRepeatState>>>,
     pending_event: Arc<Mutex<PendingEvent>>,
@@ -228,8 +230,7 @@ impl WaylandWindow {
     pub async fn new_window<F>(
         class_name: &str,
         name: &str,
-        width: usize,
-        height: usize,
+        geometry: RequestedWindowGeometry,
         config: Option<&ConfigHandle>,
         font_config: Rc<FontConfiguration>,
         event_handler: F,
@@ -271,6 +272,20 @@ impl WaylandWindow {
         conn.surface_to_window_id
             .borrow_mut()
             .insert(surface.as_ref().id(), window_id);
+
+        // TODO: populate these dimension contexts based on the wayland OutputInfo
+        let width_context = DimensionContext {
+            dpi: crate::DEFAULT_DPI as f32,
+            pixel_max: 65535.,
+            pixel_cell: 65535.,
+        };
+        let height_context = DimensionContext {
+            dpi: crate::DEFAULT_DPI as f32,
+            pixel_max: 65535.,
+            pixel_cell: 65535.,
+        };
+        let width = geometry.width.evaluate_as_pixels(width_context) as usize;
+        let height = geometry.height.evaluate_as_pixels(height_context) as usize;
 
         let dimensions = Dimensions {
             pixel_width: width,
@@ -351,6 +366,8 @@ impl WaylandWindow {
             window_state: WindowState::default(),
             last_mouse_coords: Point::new(0, 0),
             mouse_buttons: MouseButtons::NONE,
+            hscroll_remainder: 0.0,
+            vscroll_remainder: 0.0,
             modifiers: Modifiers::NONE,
             pending_event,
             pending_mouse,
@@ -505,7 +522,14 @@ impl WaylandWindowInner {
 
         if let Some((value_x, value_y)) = PendingMouse::scroll(&pending_mouse) {
             let factor = self.get_dpi_factor() as f64;
-            let discrete_x = value_x.trunc() * factor;
+
+            if value_x.signum() != self.hscroll_remainder.signum() {
+                // reset accumulator when changing scroll direction
+                self.hscroll_remainder = 0.0;
+            }
+            let scaled_x = (value_x * factor) + self.hscroll_remainder;
+            let discrete_x = scaled_x.trunc();
+            self.hscroll_remainder = scaled_x - discrete_x;
             if discrete_x != 0. {
                 let event = MouseEvent {
                     kind: MouseEventKind::HorzWheel(-discrete_x as i16),
@@ -520,7 +544,12 @@ impl WaylandWindowInner {
                 self.events.dispatch(WindowEvent::MouseEvent(event));
             }
 
-            let discrete_y = value_y.trunc() * factor;
+            if value_y.signum() != self.vscroll_remainder.signum() {
+                self.vscroll_remainder = 0.0;
+            }
+            let scaled_y = (value_y * factor) + self.vscroll_remainder;
+            let discrete_y = scaled_y.trunc();
+            self.vscroll_remainder = scaled_y - discrete_y;
             if discrete_y != 0. {
                 let event = MouseEvent {
                     kind: MouseEventKind::VertWheel(-discrete_y as i16),

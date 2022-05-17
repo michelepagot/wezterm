@@ -5,10 +5,10 @@
 //! be rendered as a popup/context menu if the system supports it; at the
 //! time of writing our window layer doesn't provide an API for context
 //! menus.
+use crate::inputmap::InputMap;
 use crate::termwindow::TermWindowNotif;
-use anyhow::anyhow;
 use config::configuration;
-use config::keyassignment::{InputMap, KeyAssignment, SpawnCommand, SpawnTabDomain};
+use config::keyassignment::{KeyAssignment, SpawnCommand, SpawnTabDomain};
 use config::lua::truncate_right;
 use fuzzy_matcher::skim::SkimMatcherV2;
 use fuzzy_matcher::FuzzyMatcher;
@@ -21,7 +21,7 @@ use mux::Mux;
 use std::collections::BTreeMap;
 use termwiz::cell::{AttributeChange, CellAttributes};
 use termwiz::color::ColorAttribute;
-use termwiz::input::{InputEvent, KeyCode, KeyEvent, MouseButtons, MouseEvent};
+use termwiz::input::{InputEvent, KeyCode, KeyEvent, Modifiers, MouseButtons, MouseEvent};
 use termwiz::surface::{Change, Position};
 use termwiz::terminal::Terminal;
 use window::WindowOps;
@@ -29,15 +29,9 @@ use window::WindowOps;
 pub use config::keyassignment::LauncherFlags;
 
 #[derive(Clone)]
-enum EntryKind {
-    Attach { domain: DomainId },
-    KeyAssignment(KeyAssignment),
-}
-
-#[derive(Clone)]
 struct Entry {
     pub label: String,
-    pub kind: EntryKind,
+    pub action: KeyAssignment,
 }
 
 pub struct LauncherTabEntry {
@@ -227,9 +221,7 @@ impl LauncherState {
                             None => "(default shell)".to_string(),
                         },
                     },
-                    kind: EntryKind::KeyAssignment(KeyAssignment::SpawnCommandInNewTab(
-                        item.clone(),
-                    )),
+                    action: KeyAssignment::SpawnCommandInNewTab(item.clone()),
                 });
             }
         }
@@ -238,19 +230,15 @@ impl LauncherState {
             let entry = if domain.state == DomainState::Attached {
                 Entry {
                     label: format!("New Tab ({})", domain.label),
-                    kind: EntryKind::KeyAssignment(KeyAssignment::SpawnCommandInNewTab(
-                        SpawnCommand {
-                            domain: SpawnTabDomain::DomainName(domain.name.to_string()),
-                            ..SpawnCommand::default()
-                        },
-                    )),
+                    action: KeyAssignment::SpawnCommandInNewTab(SpawnCommand {
+                        domain: SpawnTabDomain::DomainName(domain.name.to_string()),
+                        ..SpawnCommand::default()
+                    }),
                 }
             } else {
                 Entry {
                     label: format!("Attach {}", domain.label),
-                    kind: EntryKind::Attach {
-                        domain: domain.domain_id,
-                    },
+                    action: KeyAssignment::AttachDomain(domain.name.to_string()),
                 }
             };
 
@@ -268,10 +256,10 @@ impl LauncherState {
                 if *ws != args.active_workspace {
                     self.entries.push(Entry {
                         label: format!("Switch to workspace: `{}`", ws),
-                        kind: EntryKind::KeyAssignment(KeyAssignment::SwitchToWorkspace {
+                        action: KeyAssignment::SwitchToWorkspace {
                             name: Some(ws.clone()),
                             spawn: None,
-                        }),
+                        },
                     });
                 }
             }
@@ -280,29 +268,46 @@ impl LauncherState {
                     "Create new Workspace (current is `{}`)",
                     args.active_workspace
                 ),
-                kind: EntryKind::KeyAssignment(KeyAssignment::SwitchToWorkspace {
+                action: KeyAssignment::SwitchToWorkspace {
                     name: None,
                     spawn: None,
-                }),
+                },
             });
         }
 
         for tab in &args.tabs {
             self.entries.push(Entry {
                 label: format!("{}. {} panes", tab.title, tab.pane_count),
-                kind: EntryKind::KeyAssignment(KeyAssignment::ActivateTab(tab.tab_idx as isize)),
+                action: KeyAssignment::ActivateTab(tab.tab_idx as isize),
             });
         }
 
-        // Grab interestig key assignments and show those as a kind of command palette
+        if args.flags.contains(LauncherFlags::COMMANDS) {
+            let commands = crate::commands::CommandDef::expanded_commands(&config);
+            for cmd in commands {
+                if matches!(
+                    &cmd.action,
+                    KeyAssignment::ActivateTabRelative(_) | KeyAssignment::ActivateTab(_)
+                ) {
+                    // Filter out some noisy, repetitive entries
+                    continue;
+                }
+                self.entries.push(Entry {
+                    label: format!("{}. {}", cmd.brief, cmd.doc),
+                    action: cmd.action,
+                });
+            }
+        }
+
+        // Grab interesting key assignments and show those as a kind of command palette
         if args.flags.contains(LauncherFlags::KEY_ASSIGNMENTS) {
             let input_map = InputMap::new(&config);
             let mut key_entries: Vec<Entry> = vec![];
             // Give a consistent order to the entries
-            let keys: BTreeMap<_, _> = input_map.keys.into_iter().collect();
-            for ((keycode, mods), assignment) in keys {
+            let keys: BTreeMap<_, _> = input_map.keys.default.into_iter().collect();
+            for ((keycode, mods), entry) in keys {
                 if matches!(
-                    &assignment,
+                    &entry.action,
                     KeyAssignment::ActivateTabRelative(_) | KeyAssignment::ActivateTab(_)
                 ) {
                     // Filter out some noisy, repetitive entries
@@ -310,10 +315,7 @@ impl LauncherState {
                 }
                 if key_entries
                     .iter()
-                    .find(|ent| match &ent.kind {
-                        EntryKind::KeyAssignment(a) => a == &assignment,
-                        _ => false,
-                    })
+                    .find(|ent| ent.action == entry.action)
                     .is_some()
                 {
                     // Avoid duplicate entries
@@ -322,11 +324,11 @@ impl LauncherState {
                 key_entries.push(Entry {
                     label: format!(
                         "{:?} ({} {})",
-                        assignment,
+                        entry.action,
                         mods.to_string(),
-                        keycode.to_string()
+                        keycode.to_string().escape_debug()
                     ),
-                    kind: EntryKind::KeyAssignment(assignment),
+                    action: entry.action,
                 });
             }
             key_entries.sort_by(|a, b| a.label.cmp(&b.label));
@@ -401,23 +403,11 @@ impl LauncherState {
     }
 
     fn launch(&self, active_idx: usize) {
-        match self.filtered_entries[active_idx].clone().kind {
-            EntryKind::Attach { domain } => {
-                promise::spawn::spawn_into_main_thread(async move {
-                    // We can't inline do_domain_attach here directly
-                    // because the compiler would then want its body
-                    // to be Send :-/
-                    do_domain_attach(domain);
-                })
-                .detach();
-            }
-            EntryKind::KeyAssignment(assignment) => {
-                self.window.notify(TermWindowNotif::PerformAssignment {
-                    pane_id: self.pane_id,
-                    assignment,
-                });
-            }
-        }
+        let assignment = self.filtered_entries[active_idx].action.clone();
+        self.window.notify(TermWindowNotif::PerformAssignment {
+            pane_id: self.pane_id,
+            assignment,
+        });
     }
 
     fn move_up(&mut self) {
@@ -457,6 +447,18 @@ impl LauncherState {
                     self.move_up();
                 }
                 InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('P'),
+                    modifiers: Modifiers::CTRL,
+                }) => {
+                    self.move_up();
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('N'),
+                    modifiers: Modifiers::CTRL,
+                }) => {
+                    self.move_down();
+                }
+                InputEvent::Key(KeyEvent {
                     key: KeyCode::Char('/'),
                     ..
                 }) if !self.filtering => {
@@ -472,6 +474,16 @@ impl LauncherState {
                         self.filtering = false;
                     }
                     self.update_filter();
+                }
+                InputEvent::Key(KeyEvent {
+                    key: KeyCode::Char('G'),
+                    modifiers: Modifiers::CTRL,
+                })
+                | InputEvent::Key(KeyEvent {
+                    key: KeyCode::Escape,
+                    ..
+                }) => {
+                    break;
                 }
                 InputEvent::Key(KeyEvent {
                     key: KeyCode::Char(c),
@@ -491,12 +503,6 @@ impl LauncherState {
                     ..
                 }) => {
                     self.move_down();
-                }
-                InputEvent::Key(KeyEvent {
-                    key: KeyCode::Escape,
-                    ..
-                }) => {
-                    break;
                 }
                 InputEvent::Mouse(MouseEvent {
                     y, mouse_buttons, ..
@@ -577,15 +583,4 @@ pub fn launcher(
     state.update_filter();
     state.render(&mut term)?;
     state.run_loop(&mut term)
-}
-
-fn do_domain_attach(domain: DomainId) {
-    promise::spawn::spawn(async move {
-        let mux = Mux::get().unwrap();
-        let domain = mux
-            .get_domain(domain)
-            .ok_or_else(|| anyhow!("launcher attach called with unresolvable domain id!?"))?;
-        domain.attach().await
-    })
-    .detach();
 }

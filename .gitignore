@@ -7,6 +7,8 @@
 /wezterm*.tar.xz
 /pkg
 /target/
+/termwiz/codegen/target
+/termwiz/codegen/Cargo.lock
 /gh_pages/
 /docs/SUMMARY.md
 /docs/install/*.md
@@ -18,6 +20,7 @@
 /docs/config/lua/mux-events/index.md
 /docs/config/lua/window-events/index.md
 /docs/config/lua/keyassignment/index.md
+/docs/mermaid.min.js
 **/*.rs.bk
 .*.sw*
 /esctest.log

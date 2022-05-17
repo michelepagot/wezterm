@@ -19,26 +19,32 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v2.4.0
+        uses: actions/checkout@v3
       - name: Install Rust
         run: |
           curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable
           source $HOME/.cargo/env
           rustup update stable
-      - name: Cache mdBook
-        uses: actions/cache@v1
+      - uses: actions/cache@v3
         with:
-          path: ~/mdbook-bin
-          key: cargo-bin-mdbook-1
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-mdbook-${{ hashFiles('.github/workflows/pages.yml') }}
       - name: Install mdBook
         run: |
-          mkdir -p ~/mdbook-bin
-          (test -x ~/mdbook-bin/mdbook || (cd && cargo install --vers "^0.4" mdbook && cp -p ~/.cargo/bin/mdbook ~/mdbook-bin))
-          (test -x ~/mdbook-bin/mdbook-linkcheck || (cd && cargo install mdbook-linkcheck && cp -p ~/.cargo/bin/mdbook-linkcheck ~/mdbook-bin))
+          (test -x ~/.cargo/bin/mdbook || (cd && cargo install mdbook --no-default-features --features search --vers "^0.4" --locked))
+      - name: Install mdBook linkcheck
+        run: |
+          (test -x ~/.cargo/bin/mdbook-linkcheck || (cd && cargo install mdbook-linkcheck --locked))
+      - name: Install mdBook mermaid
+        run: |
+          (test -x ~/.cargo/bin/mdbook-mermaid || (cd && cargo install mdbook-mermaid --locked))
       - name: Build
         run: |
           source $HOME/.cargo/env
-          PATH="$HOME/mdbook-bin:$PATH"
           ./ci/build-docs.sh
       - name: Deploy
         if: success()

@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 use structopt::StructOpt;
-use termwiz::cell::CellAttributes;
+use termwiz::cell::{CellAttributes, UnicodeVersion};
 use termwiz::surface::{Line, SEQ_ZERO};
 use wezterm_bidi::Direction;
 use wezterm_client::domain::{ClientDomain, ClientDomainConfig};
@@ -26,10 +26,12 @@ use wezterm_toast_notification::*;
 
 mod cache;
 mod colorease;
+mod commands;
 mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+mod inputmap;
 mod markdown;
 mod overlay;
 mod quad;
@@ -45,7 +47,7 @@ mod update;
 mod utilsprites;
 
 pub use selection::SelectionMode;
-pub use termwindow::{set_window_class, TermWindow, ICON_DATA};
+pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DATA};
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -140,6 +142,9 @@ fn run_ssh(opts: SshCommand) -> anyhow::Result<()> {
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
+    if let Some(pos) = opts.position.as_ref() {
+        set_window_position(pos.clone());
+    }
 
     build_initial_mux(&config::configuration(), None, None)?;
 
@@ -160,6 +165,9 @@ fn run_serial(config: config::ConfigHandle, opts: &SerialCommand) -> anyhow::Res
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
+    if let Some(pos) = opts.position.as_ref() {
+        set_window_position(pos.clone());
+    }
 
     let mut serial = portable_pty::serial::SerialTty::new(&opts.port);
     if let Some(baud) = opts.baud {
@@ -171,10 +179,10 @@ fn run_serial(config: config::ConfigHandle, opts: &SerialCommand) -> anyhow::Res
     let mux = setup_mux(domain.clone(), &config, Some("local"), None)?;
 
     let gui = crate::frontend::try_new()?;
-    block_on(domain.attach())?; // FIXME: blocking
-
     {
         let window_id = mux.new_empty_window(None);
+        block_on(domain.attach(Some(*window_id)))?; // FIXME: blocking
+
         // FIXME: blocking
         let _tab = block_on(domain.spawn(config.initial_size(), None, None, *window_id))?;
     }
@@ -215,7 +223,6 @@ async fn async_run_with_domain_as_default(
     // And configure their desired domain as the default
     mux.add_domain(&domain);
     mux.set_default_domain(&domain);
-    domain.attach().await?;
 
     spawn_tab_in_default_domain_if_mux_is_empty(cmd).await
 }
@@ -223,6 +230,9 @@ async fn async_run_with_domain_as_default(
 async fn async_run_mux_client(opts: ConnectCommand) -> anyhow::Result<()> {
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
+    }
+    if let Some(pos) = opts.position.as_ref() {
+        set_window_position(pos.clone());
     }
 
     let domain = Mux::get()
@@ -267,7 +277,9 @@ async fn spawn_tab_in_default_domain_if_mux_is_empty(
     let mux = Mux::get().unwrap();
 
     let domain = mux.default_domain();
-    domain.attach().await?;
+    let window_id = mux.new_empty_window(None);
+
+    domain.attach(Some(*window_id)).await?;
 
     let have_panes_in_domain = mux
         .iter_panes()
@@ -290,7 +302,6 @@ async fn spawn_tab_in_default_domain_if_mux_is_empty(
         true
     });
 
-    let window_id = mux.new_empty_window(None);
     let _tab = domain
         .spawn(config.initial_size(), cmd, None, *window_id)
         .await?;
@@ -346,7 +357,7 @@ async fn connect_to_auto_connect_domains() -> anyhow::Result<()> {
     for dom in domains {
         if let Some(dom) = dom.downcast_ref::<ClientDomain>() {
             if dom.connect_automatically() {
-                dom.attach().await?;
+                dom.attach(None).await?;
             }
         }
     }
@@ -474,7 +485,7 @@ impl Publish {
                             Ok(true)
                         }
                         Err(err) => {
-                            log::warn!(
+                            log::trace!(
                                 "while attempting to ask existing instance to spawn: {:#}",
                                 err
                             );
@@ -569,6 +580,9 @@ fn run_terminal_gui(opts: StartCommand) -> anyhow::Result<()> {
     if let Some(cls) = opts.class.as_ref() {
         crate::set_window_class(cls);
     }
+    if let Some(pos) = opts.position.as_ref() {
+        set_window_position(pos.clone());
+    }
 
     let config = config::configuration();
     let need_builder = !opts.prog.is_empty() || opts.cwd.is_some();
@@ -593,7 +607,11 @@ fn run_terminal_gui(opts: StartCommand) -> anyhow::Result<()> {
     // First, let's see if we can ask an already running wezterm to do this.
     // We must do this before we start the gui frontend as the scheduler
     // requirements are different.
-    let mut publish = Publish::resolve(&mux, &config, opts.always_new_process);
+    let mut publish = Publish::resolve(
+        &mux,
+        &config,
+        opts.always_new_process || opts.position.is_some(),
+    );
     log::trace!("{:?}", publish);
     if publish.try_spawn(cmd.clone(), &config, opts.workspace.as_deref())? {
         return Ok(());
@@ -683,9 +701,21 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
         None
     };
 
+    let unicode_version = UnicodeVersion {
+        version: config.unicode_version,
+        ambiguous_are_wide: config.treat_east_asian_ambiguous_width_as_wide,
+    };
+
     if let Some(text) = &cmd.text {
-        let line = Line::from_text(text, &CellAttributes::default(), SEQ_ZERO);
+        let line = Line::from_text(
+            text,
+            &CellAttributes::default(),
+            SEQ_ZERO,
+            Some(unicode_version),
+        );
         let cell_clusters = line.cluster(bidi_hint);
+        let ft_lib = wezterm_font::ftwrap::Library::new()?;
+
         for cluster in cell_clusters {
             let style = font_config.match_style(&config, &cluster.attrs);
             let font = font_config.resolve_font(style)?;
@@ -703,6 +733,10 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
             // We must grab the handles after shaping, so that we get the
             // revised list that includes system fallbacks!
             let handles = font.clone_handles();
+            let faces: Vec<_> = handles
+                .iter()
+                .map(|p| ft_lib.face_from_locator(&p.handle).ok())
+                .collect();
 
             let mut iter = infos.iter().peekable();
 
@@ -737,20 +771,29 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
                 if config.custom_block_glyphs {
                     if let Some(block) = customglyph::BlockKey::from_str(&text) {
                         println!(
-                            "{:2} {:4} {:12} drawn by wezterm: {:?}",
-                            info.cluster, cluster.text, escaped, block
+                            "{:2} {:4} {:12} drawn by wezterm because custom_block_glyphs=true: {:?}",
+                            info.cluster, text, escaped, block
                         );
                         continue;
                     }
                 }
 
+                let glyph_name = faces[info.font_idx]
+                    .as_ref()
+                    .and_then(|face| {
+                        face.get_glyph_name(info.glyph_pos)
+                            .map(|name| format!("{},", name))
+                    })
+                    .unwrap_or_else(String::new);
+
                 println!(
-                    "{:2} {:4} {:12} x_adv={:<2} cells={:<2} glyph={:<4} {}\n{:38}{}",
+                    "{:2} {:4} {:12} x_adv={:<2} cells={:<2} glyph={}{:<4} {}\n{:38}{}",
                     info.cluster,
                     text,
                     escaped,
                     info.x_advance.get(),
                     info.num_cells,
+                    glyph_name,
                     info.glyph_pos,
                     parsed.lua_name(),
                     "",
@@ -813,11 +856,17 @@ pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyho
             font_dirs.len()
         );
         for font in font_dirs {
+            let pixel_sizes = if font.pixel_sizes.is_empty() {
+                "".to_string()
+            } else {
+                format!(" pixel_sizes={:?}", font.pixel_sizes)
+            };
             println!(
-                "{} -- {}{}",
+                "{} -- {}{}{}",
                 font.lua_name(),
                 font.aka(),
-                font.handle.diagnostic_string()
+                font.handle.diagnostic_string(),
+                pixel_sizes
             );
         }
 

@@ -12,13 +12,16 @@ on:
       - "ci/subst-release-info.py"
       - ".github/workflows/pages.yml"
       - ".github/workflows/verify-pages.yml"
+      - ".github/workflows/no-response.yml"
       - ".github/ISSUE_TEMPLATE/*"
       - "**/*.md"
+      - "**/*.markdown"
 
 jobs:
   build:
     runs-on: "ubuntu-latest"
     container: "debian:10.3"
+
     steps:
       - name: "set APT to non-interactive"
         shell: bash
@@ -41,6 +44,9 @@ jobs:
       - name: "Install openssh-server"
         shell: bash
         run: "apt-get install -y openssh-server"
+      - name: "Workaround git permissions issue"
+        shell: bash
+        run: "git config --global --add safe.directory /__w/wezterm/wezterm"
       - name: "checkout repo"
         uses: actions/checkout@v3
         with:
@@ -75,7 +81,7 @@ jobs:
         shell: bash
         run: "bash ci/deploy.sh"
       - name: "Upload artifact"
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: "debian10.3"
           path: |

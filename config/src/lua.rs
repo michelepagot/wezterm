@@ -1,6 +1,7 @@
 use crate::keyassignment::KeyAssignment;
 use crate::{
-    FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, Gradient, TextStyle,
+    FontAttributes, FontStretch, FontStyle, FontWeight, FreeTypeLoadTarget, Gradient, RgbaColor,
+    TextStyle,
 };
 use anyhow::anyhow;
 use bstr::BString;
@@ -390,7 +391,7 @@ fn opt_string(s: Option<&str>) -> String {
 }
 
 fn battery_info<'lua>(_: &'lua Lua, _: ()) -> mlua::Result<Vec<BatteryInfo>> {
-    use battery::{Manager, State};
+    use starship_battery::{Manager, State};
     let manager = Manager::new().map_err(|e| mlua::Error::external(e))?;
     let mut result = vec![];
     for b in manager.batteries().map_err(|e| mlua::Error::external(e))? {
@@ -461,7 +462,7 @@ struct TextStyleAttributes {
     /// foreground color, use this color instead.  This is most
     /// useful in a `[[font_rules]]` section to implement changing
     /// the text color for eg: bold text.
-    pub foreground: Option<termwiz::color::RgbColor>,
+    pub foreground: Option<RgbaColor>,
 }
 impl<'lua> FromLua<'lua> for TextStyleAttributes {
     fn from_lua(value: Value<'lua>, _lua: &'lua Lua) -> Result<Self, mlua::Error> {
@@ -994,7 +995,7 @@ mod test {
 
     #[test]
     fn can_register_and_emit_multiple_events() -> anyhow::Result<()> {
-        let _ = pretty_env_logger::formatted_builder()
+        let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();

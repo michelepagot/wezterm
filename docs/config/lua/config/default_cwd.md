@@ -17,42 +17,31 @@ local Pane. If no `cwd` can be resolved, then the `default_cwd` will be used.
 If `default_cwd` is not specified, then the home directory of the user will be
 used.
 
-```text
-                             Is initial window?
-               ______________________|______________________
-              |                                             |
-             Yes                                            No
-              |                                             |
-       Opened with CLI                  New pane, tab, or window. Opened with a
-      and `--cwd` flag?                   `SpawnCommand` that includes `cwd`?
-    __________|__________                         __________|__________
-   |                     |                       |                     |
-  Yes                    No                      No                   Yes
-   |                     |                       |                     |
-  Use                    |                Is there a value    Use `cwd` specified
-`--cwd`                  |                 set by OSC 7?       by `SpawnCommand`
-               __________|             __________|__________
-              |                       |                     |
-              |                       No                   Yes
-              |                       |                     |
-              |            Can `cwd` be resolved via    Use OSC 7
-              |            the process group leader?      value
-              |             __________|__________
-              |            |                     |
-              |            No                   Yes
-              |____________|                     |
-                    |                       Use resolved
-             Is `default_cwd`                  `cwd`
-                 defined?
-          __________|__________
-         |                     |
-        Yes                    No
-         |                     |
-        Use                 Use home
-   `default_cwd`            directory
+```mermaid
+graph TD
+    X[Determine current working directory for new pane] --> A{{Is initial window?}}
+    A -->|Yes| B[Opened with CLI and --cwd flag?]
+    A -->|No| C[New pane, tab or window.]
+    C --> D{{Opened with a SpawnCommand<br/> that includes cwd?}}
+    D -->|No| J{{Does current pane have same domain<br/>and have a value set by OSC 7?}}
+    B -->|Yes| E[Use --cwd]
+    B -->|No| F{{Is default_cwd defined?}}
+    F -->|Yes| G[Use default_cwd]
+    F -->|No| H[Use home directory]
+    D -->|Yes| I[Use cwd specified<br/> by `SpawnCommand`]
+    J -->|Yes| K[Use that OSC 7 value]
+    J -->|No| L{{Can cwd be resolved via<br/> the process group leader?}}
+    L -->|Yes| M[Use resolved cwd]
+    L -->|No| F
+
 ```
 
 On macOS and Linux, `wezterm` can attempt to resolve the process group leader
 and then attempt to resolve its current working directory. This is not
 guaranteed to succeed, and there are a number of potential edge cases (which is
 another reason for configuring your shell to use OSC 7 sequences).
+
+On Windows, there isn't a process group leader concept, but `wezterm` will
+examine the process tree of the program that it started in the current pane and
+use some heuristics to determine an approximate equivalent.
+

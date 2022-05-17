@@ -20,7 +20,7 @@ pub struct Screen {
     /// on the current window size) and will be the first line to be
     /// popped off the front of the screen when a new line is added that
     /// would otherwise have exceeded the line capacity
-    pub lines: VecDeque<Line>,
+    lines: VecDeque<Line>,
 
     /// Whenever we scroll a line off the top of the scrollback, we
     /// increment this.  We use this offset to translate between
@@ -166,6 +166,7 @@ impl Screen {
         physical_cols: usize,
         cursor: CursorPosition,
         seqno: SequenceNo,
+        is_conpty: bool,
     ) -> CursorPosition {
         let physical_rows = physical_rows.max(1);
         let physical_cols = physical_cols.max(1);
@@ -227,7 +228,29 @@ impl Screen {
 
         let new_cursor_y;
 
-        if self.config.resize_preserves_scrollback() {
+        // true if a resize operation should consider rows that have
+        // made it to scrollback as being immutable.
+        // When immutable, the resize operation will pad out the screen height
+        // with additional blank rows and due to implementation details means
+        // that the user will need to scroll back the scrollbar post-resize
+        // than they would otherwise.
+        //
+        // When mutable, resizing the window taller won't add extra rows;
+        // instead the resize will tend to have "bottom gravity" meaning that
+        // making the window taller will reveal more history than in the other
+        // mode.
+        //
+        // mutable is generally speaking a nicer experience.
+        //
+        // On Windows, the PTY layer doesn't play well with a mutable scrollback,
+        // frequently moving the cursor up to high and erasing portions of the
+        // screen.
+        //
+        // This behavior only happens with the windows pty layer; it doesn't
+        // manifest when using eg: ssh directly to a remote unix system.
+        let resize_preserves_scrollback = is_conpty;
+
+        if resize_preserves_scrollback {
             new_cursor_y = cursor
                 .y
                 .saturating_add(cursor_y as i64)
@@ -271,6 +294,11 @@ impl Screen {
     #[inline]
     pub fn line_mut(&mut self, idx: PhysRowIndex) -> &mut Line {
         &mut self.lines[idx]
+    }
+
+    /// Returns the number of occupied rows of scrollback
+    pub fn scrollback_rows(&self) -> usize {
+        self.lines.len()
     }
 
     /// Sets a line dirty.  The line is relative to the visible origin.
@@ -785,6 +813,54 @@ impl Screen {
             {
                 *cell = Cell::blank_with_attrs(blank_attr.clone());
             }
+        }
+    }
+
+    pub fn lines_in_phys_range(&self, phys_range: Range<PhysRowIndex>) -> Vec<Line> {
+        self.lines
+            .iter()
+            .skip(phys_range.start)
+            .take(phys_range.end - phys_range.start)
+            .map(|line| line.clone())
+            .collect()
+    }
+
+    pub fn get_changed_stable_rows(
+        &self,
+        stable_lines: Range<StableRowIndex>,
+        seqno: SequenceNo,
+    ) -> Vec<StableRowIndex> {
+        let phys = self.stable_range(&stable_lines);
+        let mut set = vec![];
+        for (idx, line) in self
+            .lines
+            .iter()
+            .enumerate()
+            .skip(phys.start)
+            .take(phys.end - phys.start)
+        {
+            if line.changed_since(seqno) {
+                set.push(self.phys_to_stable_row_index(idx))
+            }
+        }
+        set
+    }
+
+    pub fn for_each_phys_line<F>(&self, mut f: F)
+    where
+        F: FnMut(usize, &Line),
+    {
+        for (idx, line) in self.lines.iter().enumerate() {
+            f(idx, line);
+        }
+    }
+
+    pub fn for_each_phys_line_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, &mut Line),
+    {
+        for (idx, line) in self.lines.iter_mut().enumerate() {
+            f(idx, line);
         }
     }
 }

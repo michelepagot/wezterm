@@ -8,7 +8,7 @@ mod c1;
 mod csi;
 // mod selection; FIXME: port to render layer
 use crate::color::ColorPalette;
-use pretty_assertions::assert_eq;
+use k9::assert_equal as assert_eq;
 use std::cell::RefCell;
 use std::sync::Arc;
 use termwiz::escape::csi::{Edit, EraseInDisplay, EraseInLine};
@@ -59,7 +59,7 @@ impl TerminalConfiguration for TestTermConfig {
 
 impl TestTerm {
     fn new(height: usize, width: usize, scrollback: usize) -> Self {
-        let _ = pretty_env_logger::formatted_builder()
+        let _ = env_logger::Builder::new()
             .is_test(true)
             .filter_level(log::LevelFilter::Trace)
             .try_init();
@@ -167,20 +167,14 @@ impl TestTerm {
 
     fn assert_dirty_lines(&self, seqno: SequenceNo, expected: &[usize], reason: Option<&str>) {
         let mut seqs = vec![];
-        let dirty_indices: Vec<usize> = self
-            .screen()
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(i, line)| {
-                seqs.push(line.current_seqno());
-                if line.changed_since(seqno) {
-                    Some(i)
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let mut dirty_indices = vec![];
+
+        self.screen().for_each_phys_line(|i, line| {
+            seqs.push(line.current_seqno());
+            if line.changed_since(seqno) {
+                dirty_indices.push(i);
+            }
+        });
         assert_eq!(
             &dirty_indices, &expected,
             "actual dirty lines (left) didn't match expected dirty \
@@ -280,9 +274,9 @@ fn print_all_lines(term: &Terminal) {
     let screen = term.screen();
 
     println!("whole screen contents are:");
-    for line in screen.lines.iter() {
+    screen.for_each_phys_line(|_, line| {
         println!("[{}]", line.as_str());
-    }
+    });
 }
 
 fn print_visible_lines(term: &Terminal) {
@@ -450,7 +444,7 @@ fn test_semantic() {
     let mut input = CellAttributes::default();
     input.set_semantic_type(SemanticType::Input);
 
-    let mut prompt_line = Line::from_text("> ls -l   ", &output, SEQ_ZERO);
+    let mut prompt_line = Line::from_text("> ls -l   ", &output, SEQ_ZERO, None);
     for i in 0..2 {
         prompt_line.cells_mut()[i]
             .attrs_mut()
@@ -503,11 +497,11 @@ fn test_semantic() {
         line!(),
         &term.screen().visible_lines(),
         &[
-            Line::from_text("hello     ", &output, SEQ_ZERO),
-            Line::from_text("there     ", &output, SEQ_ZERO),
-            Line::from_text("three     ", &output, SEQ_ZERO),
+            Line::from_text("hello     ", &output, SEQ_ZERO, None),
+            Line::from_text("there     ", &output, SEQ_ZERO, None),
+            Line::from_text("three     ", &output, SEQ_ZERO, None),
             prompt_line,
-            Line::from_text("some file ", &output, SEQ_ZERO),
+            Line::from_text("some file ", &output, SEQ_ZERO, None),
         ],
         Compare::TEXT | Compare::ATTRS,
     );
@@ -1121,7 +1115,7 @@ fn test_hyperlinks() {
         line!(),
         &term.screen().visible_lines(),
         &[
-            Line::from_text("hello", &linked, SEQ_ZERO),
+            Line::from_text("hello", &linked, SEQ_ZERO, None),
             "     ".into(),
             "     ".into(),
         ],
@@ -1140,7 +1134,7 @@ fn test_hyperlinks() {
         &term.screen().visible_lines(),
         &[
             Line::from_text_with_wrapped_last_col("hello", &linked, SEQ_ZERO),
-            Line::from_text("hey!!", &linked, SEQ_ZERO),
+            Line::from_text("hey!!", &linked, SEQ_ZERO, None),
             "     ".into(),
         ],
         Compare::TEXT | Compare::ATTRS,
@@ -1155,7 +1149,7 @@ fn test_hyperlinks() {
     term.soft_reset();
     term.print("00t");
 
-    let mut partial_line = Line::from_text("wo00t", &CellAttributes::default(), SEQ_ZERO);
+    let mut partial_line = Line::from_text("wo00t", &CellAttributes::default(), SEQ_ZERO, None);
     partial_line.set_cell(
         0,
         Cell::new(

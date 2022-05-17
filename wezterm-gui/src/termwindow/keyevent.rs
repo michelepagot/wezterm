@@ -1,9 +1,101 @@
+use crate::termwindow::InputMap;
 use ::window::{DeadKeyStatus, KeyCode, KeyEvent, Modifiers, RawKeyEvent, WindowOps};
 use anyhow::Context;
+use config::keyassignment::KeyTableEntry;
 use mux::pane::Pane;
 use smol::Timer;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 use termwiz::input::KeyboardEncoding;
+
+#[derive(Debug, Clone)]
+pub struct KeyTableStateEntry {
+    name: String,
+    /// If this activation expires, when it should expire
+    expiration: Option<Instant>,
+    /// Whether this activation pops itself after recognizing a key press
+    one_shot: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct KeyTableState {
+    stack: Vec<KeyTableStateEntry>,
+}
+
+impl KeyTableState {
+    pub fn activate(
+        &mut self,
+        name: &str,
+        timeout_milliseconds: Option<u64>,
+        replace_current: bool,
+        one_shot: bool,
+    ) {
+        if replace_current {
+            self.pop();
+        }
+        self.stack.push(KeyTableStateEntry {
+            name: name.to_string(),
+            expiration: timeout_milliseconds.map(|ms| Instant::now() + Duration::from_millis(ms)),
+            one_shot,
+        });
+    }
+
+    pub fn pop(&mut self) {
+        self.stack.pop();
+    }
+
+    pub fn clear_stack(&mut self) {
+        self.stack.clear();
+    }
+
+    pub fn process_expiration(&mut self) -> bool {
+        let should_pop = self
+            .stack
+            .last()
+            .map(|entry| match entry.expiration {
+                Some(deadline) => Instant::now() >= deadline,
+                None => false,
+            })
+            .unwrap_or(false);
+        if !should_pop {
+            return false;
+        }
+        self.pop();
+        true
+    }
+
+    pub fn current_table(&mut self) -> Option<&str> {
+        while self.process_expiration() {}
+        self.stack.last().map(|entry| entry.name.as_str())
+    }
+
+    pub fn lookup_key(
+        &mut self,
+        input_map: &InputMap,
+        key: &KeyCode,
+        mods: Modifiers,
+    ) -> Option<(KeyTableEntry, Option<&str>)> {
+        while self.process_expiration() {}
+        for entry in self.stack.iter().rev() {
+            let name = entry.name.as_str();
+            if let Some(entry) = input_map.lookup_key(key, mods, Some(name)) {
+                return Some((entry, Some(name)));
+            }
+        }
+        None
+    }
+
+    pub fn did_process_key(&mut self) {
+        let should_pop = self
+            .stack
+            .last()
+            .map(|entry| entry.one_shot)
+            .unwrap_or(false);
+        if should_pop {
+            self.pop();
+        }
+    }
+}
 
 pub fn window_mods_to_termwiz_mods(modifiers: ::window::Modifiers) -> termwiz::input::Modifiers {
     let mut result = termwiz::input::Modifiers::NONE;
@@ -54,6 +146,32 @@ impl super::TermWindow {
         key.encode_win32_input_mode()
     }
 
+    fn lookup_key(
+        &mut self,
+        pane: &Rc<dyn Pane>,
+        keycode: &KeyCode,
+        mods: Modifiers,
+    ) -> Option<(KeyTableEntry, Option<String>)> {
+        if let Some(overlay) = self.pane_state(pane.pane_id()).overlay.as_mut() {
+            if let Some((entry, table_name)) =
+                overlay
+                    .key_table_state
+                    .lookup_key(&self.input_map, keycode, mods)
+            {
+                return Some((entry, table_name.map(|s| s.to_string())));
+            }
+        }
+        if let Some((entry, table_name)) =
+            self.key_table_state
+                .lookup_key(&self.input_map, keycode, mods)
+        {
+            return Some((entry, table_name.map(|s| s.to_string())));
+        }
+        self.input_map
+            .lookup_key(keycode, mods, None)
+            .map(|entry| (entry, None))
+    }
+
     fn process_key(
         &mut self,
         pane: &Rc<dyn Pane>,
@@ -86,19 +204,24 @@ impl super::TermWindow {
         }
 
         if is_down {
-            if let Some(assignment) = self
-                .input_map
-                .lookup_key(&keycode, raw_modifiers | leader_mod)
+            if let Some((entry, table_name)) =
+                self.lookup_key(pane, &keycode, raw_modifiers | leader_mod)
             {
                 if self.config.debug_key_events {
                     log::info!(
-                        "{:?} {:?} -> perform {:?}",
+                        "{}{:?} {:?} -> perform {:?}",
+                        match table_name {
+                            Some(name) => format!("table:{} ", name),
+                            None => String::new(),
+                        },
                         keycode,
                         raw_modifiers | leader_mod,
-                        assignment
+                        entry.action,
                     );
                 }
-                self.perform_key_assignment(&pane, &assignment).ok();
+
+                self.key_table_state.did_process_key();
+                self.perform_key_assignment(&pane, &entry.action).ok();
                 context.invalidate();
 
                 if leader_active {
@@ -106,6 +229,7 @@ impl super::TermWindow {
                     // virtual modifier state
                     self.leader_done();
                 }
+
                 return true;
             }
         }
@@ -138,7 +262,8 @@ impl super::TermWindow {
                     || (!raw_modifiers.contains(Modifiers::RIGHT_ALT)
                         && !raw_modifiers.contains(Modifiers::LEFT_ALT)
                         && raw_modifiers.contains(Modifiers::ALT)
-                        && !config.send_composed_key_when_alt_is_pressed);
+                        && !(config.send_composed_key_when_left_alt_is_pressed
+                             || config.send_composed_key_when_right_alt_is_pressed));
 
             if bypass_compose {
                 if let Key::Code(term_key) = self.win_key_code_to_termwiz_key_code(keycode) {
@@ -181,12 +306,6 @@ impl super::TermWindow {
     }
 
     pub fn raw_key_event_impl(&mut self, key: RawKeyEvent, context: &dyn WindowOps) {
-        if self.config.debug_key_events {
-            log::info!("key_event {:?}", key);
-        } else {
-            log::trace!("key_event {:?}", key);
-        }
-
         // The leader key is a kind of modal modifier key.
         // It is allowed to be active for up to the leader timeout duration,
         // after which it auto-deactivates.
@@ -196,6 +315,20 @@ impl super::TermWindow {
         } else {
             (false, Modifiers::NONE)
         };
+
+        if self.config.debug_key_events {
+            log::info!(
+                "key_event {:?} {}",
+                key,
+                if leader_active { "LEADER" } else { "" }
+            );
+        } else {
+            log::trace!(
+                "key_event {:?} {}",
+                key,
+                if leader_active { "LEADER" } else { "" }
+            );
+        }
 
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
@@ -288,6 +421,16 @@ impl super::TermWindow {
         }
     }
 
+    pub fn current_key_table_name(&mut self) -> Option<String> {
+        let name = self.key_table_state.current_table().map(|s| s.to_string());
+        if let Some(entry) = self.key_table_state.stack.last() {
+            if let Some(expiry) = entry.expiration {
+                self.update_next_frame_time(Some(expiry));
+            }
+        }
+        name
+    }
+
     pub fn composition_status(&self) -> &DeadKeyStatus {
         &self.dead_key_status
     }
@@ -301,12 +444,6 @@ impl super::TermWindow {
     }
 
     pub fn key_event_impl(&mut self, window_key: KeyEvent, context: &dyn WindowOps) {
-        if self.config.debug_key_events {
-            log::info!("key_event {:?}", window_key);
-        } else {
-            log::trace!("key_event {:?}", window_key);
-        }
-
         let pane = match self.get_active_pane_or_overlay() {
             Some(pane) => pane,
             None => return,
@@ -321,6 +458,20 @@ impl super::TermWindow {
         } else {
             (false, Modifiers::NONE)
         };
+
+        if self.config.debug_key_events {
+            log::info!(
+                "key_event {:?} {}",
+                window_key,
+                if leader_active { "LEADER" } else { "" }
+            );
+        } else {
+            log::trace!(
+                "key_event {:?} {}",
+                window_key,
+                if leader_active { "LEADER" } else { "" }
+            );
+        }
 
         let modifiers = window_mods_to_termwiz_mods(window_key.modifiers);
 
@@ -341,12 +492,15 @@ impl super::TermWindow {
 
         match key {
             Key::Code(key) => {
-                if window_key.key_is_down && leader_active && !key.is_modifier() {
-                    // Leader was pressed and this non-modifier keypress isn't
-                    // a registered key binding; swallow this event and cancel
-                    // the leader modifier.
-                    self.leader_done();
-                    return;
+                if window_key.key_is_down && !key.is_modifier() {
+                    if leader_active {
+                        // Leader was pressed and this non-modifier keypress isn't
+                        // a registered key binding; swallow this event and cancel
+                        // the leader modifier.
+                        self.leader_done();
+                        return;
+                    }
+                    self.key_table_state.did_process_key();
                 }
 
                 if self.config.debug_key_events {
@@ -395,6 +549,7 @@ impl super::TermWindow {
                     self.leader_done();
                     return;
                 }
+                self.key_table_state.did_process_key();
                 if self.config.debug_key_events {
                     log::info!("send to pane string={:?}", s);
                 }

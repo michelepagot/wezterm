@@ -201,13 +201,14 @@ impl ScreenOrAlt {
         cursor_main: CursorPosition,
         cursor_alt: CursorPosition,
         seqno: SequenceNo,
+        is_conpty: bool,
     ) -> (CursorPosition, CursorPosition) {
-        let cursor_main = self
-            .screen
-            .resize(physical_rows, physical_cols, cursor_main, seqno);
-        let cursor_alt = self
-            .alt_screen
-            .resize(physical_rows, physical_cols, cursor_alt, seqno);
+        let cursor_main =
+            self.screen
+                .resize(physical_rows, physical_cols, cursor_main, seqno, is_conpty);
+        let cursor_alt =
+            self.alt_screen
+                .resize(physical_rows, physical_cols, cursor_alt, seqno, is_conpty);
         (cursor_main, cursor_alt)
     }
 
@@ -368,6 +369,7 @@ pub struct TerminalState {
     unicode_version: UnicodeVersion,
     unicode_version_stack: Vec<UnicodeVersionStackEntry>,
 
+    enable_conpty_quirks: bool,
     /// On Windows, the ConPTY layer emits an OSC sequence to
     /// set the title shortly after it starts up.
     /// We don't want that, so we use this flag to remember
@@ -495,7 +497,7 @@ impl TerminalState {
 
         let color_map = default_color_map();
 
-        let unicode_version = UnicodeVersion(config.unicode_version());
+        let unicode_version = config.unicode_version();
 
         TerminalState {
             config,
@@ -556,6 +558,7 @@ impl TerminalState {
             unicode_version,
             unicode_version_stack: vec![],
             suppress_initial_title_change: false,
+            enable_conpty_quirks: false,
             accumulating_title: None,
             lost_focus_seqno: seqno,
             focused: true,
@@ -564,7 +567,8 @@ impl TerminalState {
         }
     }
 
-    pub fn set_supress_initial_title_change(&mut self) {
+    pub fn enable_conpty_quirks(&mut self) {
+        self.enable_conpty_quirks = true;
         self.suppress_initial_title_change = true;
     }
 
@@ -679,11 +683,13 @@ impl TerminalState {
         self.erase_in_display(EraseInDisplay::EraseScrollback);
 
         let row_index = self.screen.phys_row(self.cursor.y);
-        let row = self.screen.lines[row_index].clone();
+        let rows = self.screen.lines_in_phys_range(row_index..row_index + 1);
 
         self.erase_in_display(EraseInDisplay::EraseDisplay);
 
-        self.screen.lines[0] = row;
+        for (idx, row) in rows.into_iter().enumerate() {
+            *self.screen.line_mut(idx) = row;
+        }
 
         self.cursor.y = 0;
     }
@@ -715,6 +721,9 @@ impl TerminalState {
 
     /// Advise the terminal about a change in its focus state
     pub fn focus_changed(&mut self, focused: bool) {
+        if focused == self.focused {
+            return;
+        }
         if !focused {
             // notify app of release of buttons
             let buttons = self.current_mouse_buttons.clone();
@@ -819,6 +828,7 @@ impl TerminalState {
             cursor_main,
             cursor_alt,
             self.seqno,
+            self.enable_conpty_quirks,
         );
         self.top_and_bottom_margins = 0..physical_rows as i64;
         self.left_and_right_margins = 0..physical_cols;
@@ -856,9 +866,9 @@ impl TerminalState {
     pub fn make_all_lines_dirty(&mut self) {
         let seqno = self.seqno;
         let screen = self.screen_mut();
-        for line in &mut screen.lines {
+        screen.for_each_phys_line_mut(|_, line| {
             line.update_last_change_seqno(seqno);
-        }
+        });
     }
 
     /// Returns the 0-based cursor position relative to the top left of
@@ -1158,6 +1168,7 @@ impl TerminalState {
             res.escape_debug()
         );
         self.writer.write_all(res.as_bytes()).ok();
+        self.writer.flush().ok();
     }
 
     fn perform_device(&mut self, dev: Device) {
@@ -1199,7 +1210,18 @@ impl TerminalState {
                 self.writer.flush().ok();
             }
             Device::RequestSecondaryDeviceAttributes => {
-                self.writer.write(b"\x1b[>0;0;0c").ok();
+                // Response is: Pp ; Pv ; Pc
+                // Where Pp=1 means vt220
+                // and Pv is the firmware version.
+                // Pc is always 0.
+                // Because our default TERM is xterm, the firmware
+                // version will be considered to be equialent to xterm's
+                // patch levels, with the following effects:
+                // pv < 95 -> ttymouse=xterm
+                // pv >= 95 < 277 -> ttymouse=xterm2
+                // pv >= 277 -> ttymouse=sgr
+                // pv >= 279 - xterm will probe for additional device settings.
+                self.writer.write(b"\x1b[>1;277;0c").ok();
                 self.writer.flush().ok();
             }
             Device::RequestTertiaryDeviceAttributes => {
@@ -1299,6 +1321,7 @@ impl TerminalState {
 
         log::trace!("{:?} -> recognized={} status={}", mode, recognized, status);
         write!(self.writer, "\x1b[{}{};{}$y", prefix, number, status).ok();
+        self.writer.flush().ok();
     }
 
     fn perform_csi_mode(&mut self, mode: Mode) {
@@ -2486,7 +2509,7 @@ impl TerminalState {
         let mut zones = vec![];
 
         let first_stable_row = screen.phys_to_stable_row_index(0);
-        for (idx, line) in screen.lines.iter_mut().enumerate() {
+        screen.for_each_phys_line_mut(|idx, line| {
             let stable_row = first_stable_row + idx as StableRowIndex;
 
             for zone_range in line.semantic_zone_ranges() {
@@ -2514,7 +2537,7 @@ impl TerminalState {
                     zone.end_y = stable_row;
                 }
             }
-        }
+        });
         if let Some(zone) = current_zone.take() {
             zones.push(zone);
         }

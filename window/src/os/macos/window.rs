@@ -1,28 +1,31 @@
 // let () = msg_send! is a common pattern for objc
 #![allow(clippy::let_unit_value)]
 
+use super::keycodes::*;
 use super::{nsstring, nsstring_to_str};
 use crate::connection::ConnectionOps;
 use crate::parameters::{Border, Parameters, TitleBar};
 use crate::{
-    Clipboard, Connection, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Length,
-    Modifiers, MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point,
-    RawKeyEvent, Rect, ScreenPoint, Size, WindowDecorations, WindowEvent, WindowEventSender,
-    WindowOps, WindowState,
+    Clipboard, Connection, DeadKeyStatus, Dimensions, Handled, KeyCode, KeyEvent, Modifiers,
+    MouseButtons, MouseCursor, MouseEvent, MouseEventKind, MousePress, Point, RawKeyEvent, Rect,
+    RequestedWindowGeometry, ScreenPoint, Size, ULength, WindowDecorations, WindowEvent,
+    WindowEventSender, WindowOps, WindowState,
 };
 use anyhow::{anyhow, bail, ensure};
 use async_trait::async_trait;
+use clipboard_macos::Clipboard as ClipboardContext;
 use cocoa::appkit::{
     self, CGFloat, NSApplication, NSApplicationActivateIgnoringOtherApps,
     NSApplicationPresentationOptions, NSBackingStoreBuffered, NSEvent, NSEventModifierFlags,
-    NSOpenGLContext, NSOpenGLPixelFormat, NSRunningApplication, NSScreen, NSView,
+    NSOpenGLContext, NSOpenGLPixelFormat, NSPasteboard, NSRunningApplication, NSScreen, NSView,
     NSViewHeightSizable, NSViewWidthSizable, NSWindow, NSWindowStyleMask,
 };
 use cocoa::base::*;
 use cocoa::foundation::{
-    NSArray, NSAutoreleasePool, NSInteger, NSNotFound, NSPoint, NSRect, NSSize, NSUInteger,
+    NSArray, NSAutoreleasePool, NSFastEnumeration, NSInteger, NSNotFound, NSPoint, NSRect, NSSize,
+    NSUInteger,
 };
-use config::ConfigHandle;
+use config::{ConfigHandle, DimensionContext, GeometryOrigin};
 use core_foundation::base::{CFTypeID, TCFType};
 use core_foundation::bundle::{CFBundleGetBundleWithIdentifier, CFBundleGetFunctionPointerForName};
 use core_foundation::data::{CFData, CFDataGetBytePtr, CFDataRef};
@@ -38,10 +41,12 @@ use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
 use std::any::Any;
 use std::cell::RefCell;
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::time::Instant;
 use wezterm_font::FontConfiguration;
+use wezterm_input_types::is_ascii_control;
 
 #[allow(non_upper_case_globals)]
 const NSViewLayerContentsPlacementTopLeft: NSInteger = 11;
@@ -383,8 +388,7 @@ impl Window {
     pub async fn new_window<F>(
         _class_name: &str,
         name: &str,
-        width: usize,
-        height: usize,
+        geometry: RequestedWindowGeometry,
         config: Option<&ConfigHandle>,
         _font_config: Rc<FontConfiguration>,
         event_handler: F,
@@ -396,6 +400,8 @@ impl Window {
             Some(c) => c.clone(),
             None => config::configuration(),
         };
+
+        let ResolvedGeometry { width, height, pos } = resolve_geom(geometry);
 
         unsafe {
             let style_mask = decoration_to_mask(config.window_decorations);
@@ -463,14 +469,15 @@ impl Window {
             thread_local! {
                 static LAST_POSITION: RefCell<Option<NSPoint>> = RefCell::new(None);
             }
-            LAST_POSITION.with(|pos| {
-                let next_pos = if let Some(last_pos) = pos.borrow_mut().take() {
-                    window.cascadeTopLeftFromPoint_(last_pos)
+            LAST_POSITION.with(|last_pos| {
+                let pos = pos.or_else(|| last_pos.borrow_mut().take());
+                let next_pos = if let Some(pos) = pos {
+                    window.cascadeTopLeftFromPoint_(pos)
                 } else {
                     window.center();
-                    window.cascadeTopLeftFromPoint_(NSPoint::new(0.0, 0.0))
+                    window.cascadeTopLeftFromPoint_(NSPoint::new(0., 0.))
                 };
-                pos.borrow_mut().replace(next_pos);
+                last_pos.borrow_mut().replace(next_pos);
             });
 
             window.setTitle_(*nsstring(&name));
@@ -487,6 +494,13 @@ impl Window {
 
             window.setContentView_(*view);
             window.setDelegate_(*view);
+
+            // register for drag and drop operations.
+            let () = msg_send![
+                *window,
+                registerForDraggedTypes:
+                    NSArray::arrayWithObject(nil, appkit::NSFilenamesPboardType)
+            ];
 
             let frame = NSView::frame(*view);
             let backing_frame = NSView::convertRectToBacking(*view, frame);
@@ -641,18 +655,16 @@ impl WindowOps for Window {
     }
 
     fn get_clipboard(&self, _clipboard: Clipboard) -> Future<String> {
-        use clipboard::ClipboardProvider;
         Future::result(
-            clipboard::ClipboardContext::new()
-                .and_then(|mut ctx| ctx.get_contents())
+            ClipboardContext::new()
+                .and_then(|ctx| ctx.read())
                 .map_err(|e| anyhow!("Failed to get clipboard:{}", e)),
         )
     }
 
     fn set_clipboard(&self, _clipboard: Clipboard, text: String) {
-        use clipboard::ClipboardProvider;
-        clipboard::ClipboardContext::new()
-            .and_then(|mut ctx| ctx.set_contents(text))
+        ClipboardContext::new()
+            .and_then(|mut ctx| ctx.write(text))
             .ok();
     }
 
@@ -712,11 +724,17 @@ impl WindowOps for Window {
                     }
                     let insets: NSEdgeInsets = unsafe { msg_send![main_screen, safeAreaInsets] };
                     log::trace!("{:?}", insets);
+
+                    // Bleh, the API is supposed to give us the right metrics, but it needs
+                    // a tweak to look good around the notch.
+                    // <https://github.com/wez/wezterm/issues/1737#issuecomment-1085923867>
+                    let top = insets.top.ceil() as usize;
+                    let top = if top > 0 { top + 2 } else { 0 };
                     Some(Border {
-                        top: Length::new(insets.top.ceil() as isize),
-                        left: Length::new(insets.left.ceil() as isize),
-                        right: Length::new(insets.right.ceil() as isize),
-                        bottom: Length::new(insets.bottom.ceil() as isize),
+                        top: ULength::new(top),
+                        left: ULength::new(insets.left.ceil() as usize),
+                        right: ULength::new(insets.right.ceil() as usize),
+                        bottom: ULength::new(insets.bottom.ceil() as usize),
                         color: crate::color::LinearRgba::with_components(0., 0., 0., 1.),
                     })
                 } else {
@@ -728,8 +746,8 @@ impl WindowOps for Window {
 
         Ok(Some(Parameters {
             title_bar: TitleBar {
-                padding_left: Length::new(0),
-                padding_right: Length::new(0),
+                padding_left: ULength::new(0),
+                padding_right: ULength::new(0),
                 height: None,
                 font_and_size: None,
             },
@@ -1197,6 +1215,89 @@ enum TranslateStatus {
     NotDead,
 }
 
+/// Represents the current keyboard layout.
+/// Holds state needed to perform keymap translation.
+struct Keyboard {
+    _kbd: InputSource,
+    layout_data: CFData,
+}
+
+/// Slightly more intelligible parameters for keymap translation
+struct TranslateParams {
+    virtual_key_code: u16,
+    modifier_flags: NSEventModifierFlags,
+    dead_state: u32,
+    ignore_dead_keys: bool,
+    display: bool,
+}
+
+/// The results of a keymap translation
+#[derive(Debug)]
+struct TranslateResults {
+    dead_state: u32,
+    text: String,
+}
+
+impl Keyboard {
+    pub fn new() -> Self {
+        let _kbd =
+            unsafe { InputSource::wrap_under_create_rule(TISCopyCurrentKeyboardInputSource()) };
+
+        let layout_data = unsafe {
+            CFData::wrap_under_get_rule(TISGetInputSourceProperty(
+                _kbd.as_concrete_TypeRef(),
+                kTISPropertyUnicodeKeyLayoutData,
+            ))
+        };
+        Self { _kbd, layout_data }
+    }
+
+    /// A wrapper around UCKeyTranslate
+    pub fn translate(&self, params: TranslateParams) -> anyhow::Result<TranslateResults> {
+        let layout_data = unsafe {
+            CFDataGetBytePtr(self.layout_data.as_concrete_TypeRef()) as *const UCKeyboardLayout
+        };
+
+        let modifier_key_state: u32 = (params.modifier_flags.bits() >> 16) as u32 & 0xFF;
+
+        let kbd_type = unsafe { LMGetKbdType() } as _;
+        #[allow(non_upper_case_globals)]
+        const kUCKeyTranslateNoDeadKeysBit: u32 = 0;
+
+        let mut unicode_buffer = [0u16; 32];
+        let mut length = 0;
+        let mut dead_state = params.dead_state;
+        unsafe {
+            UCKeyTranslate(
+                layout_data,
+                params.virtual_key_code,
+                if params.display {
+                    kUCKeyActionDisplay
+                } else {
+                    kUCKeyActionDown
+                },
+                modifier_key_state,
+                kbd_type,
+                if params.ignore_dead_keys {
+                    1 << kUCKeyTranslateNoDeadKeysBit
+                } else {
+                    0
+                },
+                &mut dead_state,
+                unicode_buffer.len() as _,
+                &mut length,
+                unicode_buffer.as_mut_ptr(),
+            )
+        };
+
+        let text = String::from_utf16(unsafe {
+            std::slice::from_raw_parts(unicode_buffer.as_mut_ptr(), length as _)
+        })?;
+
+        Ok(TranslateResults { text, dead_state })
+    }
+}
+
 impl Inner {
     fn enable_opengl(&mut self) -> anyhow::Result<Rc<glium::backend::Context>> {
         let view = self.view_id.as_ref().unwrap().load();
@@ -1215,29 +1316,8 @@ impl Inner {
         &mut self,
         virtual_key_code: u16,
         modifier_flags: NSEventModifierFlags,
-    ) -> Result<TranslateStatus, std::string::FromUtf16Error> {
-        let kbd =
-            unsafe { InputSource::wrap_under_create_rule(TISCopyCurrentKeyboardInputSource()) };
-
-        let layout_data = unsafe {
-            CFData::wrap_under_get_rule(TISGetInputSourceProperty(
-                kbd.as_concrete_TypeRef(),
-                kTISPropertyUnicodeKeyLayoutData,
-            ))
-        };
-
-        let layout_data = unsafe {
-            CFDataGetBytePtr(layout_data.as_concrete_TypeRef()) as *const UCKeyboardLayout
-        };
-
-        let modifier_key_state: u32 = (modifier_flags.bits() >> 16) as u32 & 0xFF;
-
-        let kbd_type = unsafe { LMGetKbdType() } as _;
-
-        let mut unicode_buffer = [0u16; 8];
-        let mut length = 0;
-
-        let mut dead_state = 0;
+    ) -> anyhow::Result<TranslateStatus> {
+        let keyboard = Keyboard::new();
 
         let mods = key_modifiers(modifier_flags);
 
@@ -1253,100 +1333,62 @@ impl Inner {
             true
         };
 
-        #[allow(non_upper_case_globals)]
-        const kUCKeyTranslateNoDeadKeysBit: u32 = 0;
+        if let Some(DeadKeyState { dead_state }) = self.dead_pending.take() {
+            let result = keyboard.translate(TranslateParams {
+                virtual_key_code,
+                modifier_flags,
+                dead_state,
+                ignore_dead_keys: false,
+                display: true,
+            })?;
 
-        if let Some(state) = self.dead_pending.take() {
-            dead_state = state.dead_state;
-        } else if use_dead_keys {
-            unsafe {
-                UCKeyTranslate(
-                    layout_data,
+            // If length == 0 it means that they double-pressed the dead key.
+            // We treat that the same as the dead key disabled state:
+            // we want to clock through a space keypress so that we clear
+            // the state and output the original keypress.
+            let generate_space = !use_dead_keys || result.text.len() == 0;
+
+            if generate_space {
+                // synthesize a SPACE press to
+                // elicit the underlying key code and get out
+                // of the dead key state
+                let result = keyboard.translate(TranslateParams {
                     virtual_key_code,
-                    kUCKeyActionDown,
-                    modifier_key_state,
-                    kbd_type,
-                    0,
-                    &mut dead_state,
-                    unicode_buffer.len() as _,
-                    &mut length,
-                    unicode_buffer.as_mut_ptr(),
-                );
+                    modifier_flags,
+                    dead_state: result.dead_state,
+                    ignore_dead_keys: false,
+                    display: false,
+                })?;
+                Ok(TranslateStatus::Composed(result.text))
+            } else {
+                Ok(TranslateStatus::Composed(result.text))
             }
+        } else if use_dead_keys {
+            let result = keyboard.translate(TranslateParams {
+                virtual_key_code,
+                modifier_flags,
+                dead_state: 0,
+                ignore_dead_keys: false,
+                display: false,
+            })?;
 
-            self.dead_pending.replace(DeadKeyState { dead_state });
+            self.dead_pending.replace(DeadKeyState {
+                dead_state: result.dead_state,
+            });
 
             // Get the non-dead-key rendition to show as the composing state
-            dead_state = 0;
-            length = 0;
-            unsafe {
-                UCKeyTranslate(
-                    layout_data,
-                    virtual_key_code,
-                    kUCKeyActionDisplay,
-                    modifier_key_state,
-                    kbd_type,
-                    1 << kUCKeyTranslateNoDeadKeysBit,
-                    &mut dead_state,
-                    unicode_buffer.len() as _,
-                    &mut length,
-                    unicode_buffer.as_mut_ptr(),
-                );
-            };
-
-            let composing = String::from_utf16(unsafe {
-                std::slice::from_raw_parts(unicode_buffer.as_mut_ptr(), length as _)
-            })?;
-            return Ok(TranslateStatus::Composing(composing));
-        } else {
-            return Ok(TranslateStatus::NotDead);
-        }
-        length = 0;
-        unsafe {
-            UCKeyTranslate(
-                layout_data,
+            let composing = keyboard.translate(TranslateParams {
                 virtual_key_code,
-                kUCKeyActionDisplay,
-                modifier_key_state,
-                kbd_type,
-                0,
-                &mut dead_state,
-                unicode_buffer.len() as _,
-                &mut length,
-                unicode_buffer.as_mut_ptr(),
-            );
-        };
+                modifier_flags,
+                dead_state: 0,
+                ignore_dead_keys: true,
+                display: true,
+            })?;
 
-        // If length == 0 it means that they double-pressed the dead key.
-        // We treat that the same as the dead key disabled state:
-        // we want to clock through a space keypress so that we clear
-        // the state and output the original keypress.
-        let generate_space = !use_dead_keys || length == 0;
-
-        if generate_space {
-            // synthesize a SPACE press to
-            // elicit the underlying key code and get out
-            // of the dead key state
-            unsafe {
-                UCKeyTranslate(
-                    layout_data,
-                    super::keycodes::kVK_Space,
-                    kUCKeyActionDown,
-                    0,
-                    kbd_type,
-                    0,
-                    &mut dead_state,
-                    unicode_buffer.len() as _,
-                    &mut length,
-                    unicode_buffer.as_mut_ptr(),
-                );
-            }
+            Ok(TranslateStatus::Composing(composing.text))
+        } else {
+            Ok(TranslateStatus::NotDead)
         }
-
-        let composed = String::from_utf16(unsafe {
-            std::slice::from_raw_parts(unicode_buffer.as_mut_ptr(), length as _)
-        })?;
-        Ok(TranslateStatus::Composed(composed))
     }
 }
 
@@ -1473,14 +1515,7 @@ impl WindowView {
         let selector = format!("{:?}", a_selector);
         log::trace!("do_command_by_selector {:?}", selector);
 
-        let (key, modifiers) = match selector.as_ref() {
-            "cancel:" => {
-                // FIXME: this isn't scalable to various keys
-                // and we lose eg: SHIFT if that is also pressed at the same time.
-                // However, CTRL-ESC is processed BEFORE sending any other
-                // key events so we have no choice but to do it this way.
-                (KeyCode::Char('\x1b'), Modifiers::CTRL)
-            }
+        match selector.as_ref() {
             "scrollToBeginningOfDocument:"
             | "scrollToEndOfDocument:"
             | "scrollPageUp:"
@@ -1488,8 +1523,11 @@ impl WindowView {
             | "moveLeft:"
             | "moveRight:"
             | "moveUp:"
+            | "moveUpAndModifySelection:"
             | "moveDown:"
+            | "moveDownAndModifySelection:"
             | "insertTab:"
+            | "insertBacktab:"
             | "insertNewline:"
             | "cancelOperation:"
             | "deleteBackward:"
@@ -1500,7 +1538,6 @@ impl WindowView {
                     inner.ime_state = ImeDisposition::Continue;
                     inner.ime_last_event.take();
                 }
-                return;
             }
             _ => {
                 log::warn!("UNHANDLED: IME: do_command_by_selector: {:?}", selector);
@@ -1510,24 +1547,7 @@ impl WindowView {
                     inner.ime_state = ImeDisposition::Continue;
                     inner.ime_last_event.take();
                 }
-                return;
             }
-        };
-
-        let event = KeyEvent {
-            key,
-            modifiers,
-            repeat_count: 1,
-            key_is_down: true,
-            raw: None,
-        }
-        .normalize_shift();
-
-        if let Some(myself) = Self::get_this(this) {
-            let mut inner = myself.inner.borrow_mut();
-            inner.ime_state = ImeDisposition::Acted;
-            inner.ime_last_event.replace(event.clone());
-            inner.events.dispatch(WindowEvent::KeyEvent(event));
         }
     }
 
@@ -2008,40 +2028,35 @@ impl WindowView {
             key_is_down
         );
 
-        // Ungh, this is a horrible special case.
-        // CTRL-Tab only delivers a key-up event, and never a
-        // key-down event.  So we just pretend that key-up is
-        // key-down.
-        let key_is_down = if virtual_key == super::keycodes::kVK_Tab
-            && modifiers.contains(Modifiers::CTRL)
-            && !key_is_down
-        {
-            true
-        } else {
-            key_is_down
-        };
-
         // `Delete` on macos is really Backspace and emits BS.
         // `Fn-Delete` emits DEL.
         // Alt-Delete is mapped by the IME to be equivalent to Fn-Delete.
         // We want to emit Alt-BS in that situation.
-        let unmod =
-            if virtual_key == super::keycodes::kVK_Delete && modifiers.contains(Modifiers::ALT) {
-                "\x08"
-            } else if virtual_key == super::keycodes::kVK_Tab {
-                "\t"
-            } else if virtual_key == super::keycodes::kVK_Delete {
-                "\x08"
-            } else if virtual_key == super::keycodes::kVK_ANSI_KeypadEnter {
-                // https://github.com/wez/wezterm/issues/739
-                // Keypad enter sends ctrl-c for some reason; explicitly
-                // treat that as enter here.
-                "\r"
-            } else {
-                unmod
-            };
+        let unmod = if virtual_key == kVK_Delete && modifiers.contains(Modifiers::ALT) {
+            "\x08"
+        } else if virtual_key == kVK_Tab {
+            "\t"
+        } else if virtual_key == kVK_Delete {
+            "\x08"
+        } else if virtual_key == kVK_ANSI_KeypadEnter {
+            // https://github.com/wez/wezterm/issues/739
+            // Keypad enter sends ctrl-c for some reason; explicitly
+            // treat that as enter here.
+            "\r"
+        } else {
+            unmod
+        };
 
-        let phys_code = super::keycodes::vkey_to_phys(virtual_key);
+        // Shift-Tab on macOS produces \x19 for some reason.
+        // Rewrite it to something we understand.
+        // <https://github.com/wez/wezterm/issues/1902>
+        let chars = if virtual_key == kVK_Tab && modifiers == Modifiers::SHIFT {
+            "\t"
+        } else {
+            chars
+        };
+
+        let phys_code = vkey_to_phys(virtual_key);
         let raw_key_handled = Handled::new();
         let raw_key_event = RawKeyEvent {
             key: if unmod.is_empty() {
@@ -2142,12 +2157,10 @@ impl WindowView {
             modifiers
         };
 
-        let only_alt = (modifiers & !(Modifiers::LEFT_ALT | Modifiers::RIGHT_ALT | Modifiers::ALT))
-            == Modifiers::NONE;
-        let only_left_alt =
-            (modifiers & !(Modifiers::LEFT_ALT | Modifiers::ALT)) == Modifiers::NONE;
-        let only_right_alt =
-            (modifiers & !(Modifiers::RIGHT_ALT | Modifiers::ALT)) == Modifiers::NONE;
+        let alt_mods = Modifiers::LEFT_ALT | Modifiers::RIGHT_ALT | Modifiers::ALT;
+        let only_alt = (modifiers & alt_mods) == Modifiers::ALT;
+        let only_left_alt = (modifiers & alt_mods) == (Modifiers::LEFT_ALT | Modifiers::ALT);
+        let only_right_alt = (modifiers & alt_mods) == (Modifiers::RIGHT_ALT | Modifiers::ALT);
 
         // Also respect `send_composed_key_when_(left|right)_alt_is_pressed` configs
         // when `use_ime` is true.
@@ -2175,11 +2188,6 @@ impl WindowView {
                 let array: id = msg_send![class!(NSArray), arrayWithObject: nsevent];
                 let _: () = msg_send![this, interpretKeyEvents: array];
 
-                /*
-                let input_context: id = msg_send![this, inputContext];
-                let res: BOOL = msg_send![input_context, handleEvent: nsevent];
-                if res == YES {
-                */
                 if let Some(myself) = Self::get_this(this) {
                     let mut inner = myself.inner.borrow_mut();
                     log::trace!(
@@ -2257,6 +2265,21 @@ impl WindowView {
             }
         }
 
+        // When both shift and alt are pressed, macos appears to swap `chars` with `unmod`,
+        // which isn't particularly helpful. eg: ALT+SHIFT+` produces chars='`' and unmod='~'
+        // In this case, we take the key from unmod.
+        // We leave `raw` set to None as we want to preserve the value of modifiers.
+        // <https://github.com/wez/wezterm/issues/1706>.
+        // We can't do this for every ALT+SHIFT combo, as the weird behavior doesn't
+        // apply to eg: ALT+SHIFT+789 for Norwegian layouts
+        // <https://github.com/wez/wezterm/issues/760>
+        let swap_unmod_and_chars = (modifiers.contains(Modifiers::SHIFT | Modifiers::ALT)
+            && virtual_key == kVK_ANSI_Grave)
+            ||
+            // <https://github.com/wez/wezterm/issues/1907>
+            (modifiers.contains(Modifiers::SHIFT | Modifiers::CTRL)
+                && virtual_key == kVK_ANSI_Slash);
+
         if let Some(key) = key_string_to_key_code(chars).or_else(|| key_string_to_key_code(unmod)) {
             let (key, raw_key) = if (only_left_alt && !send_composed_key_when_left_alt_is_pressed)
                 || (only_right_alt && !send_composed_key_when_right_alt_is_pressed)
@@ -2268,22 +2291,7 @@ impl WindowView {
                 }
             } else if chars.is_empty() || chars == unmod {
                 (key, None)
-            } else if !chars.is_empty()
-                && !unmod.is_empty()
-                && modifiers.contains(Modifiers::SHIFT)
-                && modifiers.contains(Modifiers::ALT)
-                && (virtual_key == super::keycodes::kVK_ANSI_Grave
-                    || virtual_key == super::keycodes::kVK_ANSI_LeftBracket
-                    || virtual_key == super::keycodes::kVK_ANSI_RightBracket)
-            {
-                // When both shift and alt are pressed, macos appears to swap `chars` with `unmod`,
-                // which isn't particularly helpful. eg: ALT+SHIFT+` produces chars='`' and unmod='~'
-                // In this case, we take the key from unmod.
-                // We leave `raw` set to None as we want to preserve the value of modifiers.
-                // <https://github.com/wez/wezterm/issues/1706>.
-                // We can't do this for every ALT+SHIFT combo, as the weird behavior doesn't
-                // apply to eg: ALT+SHIFT+789 for Norwegian layouts
-                // <https://github.com/wez/wezterm/issues/760>
+            } else if swap_unmod_and_chars {
                 match key_string_to_key_code(unmod) {
                     Some(key) => (key, None),
                     None => return,
@@ -2292,8 +2300,23 @@ impl WindowView {
                 let raw = key_string_to_key_code(unmod);
                 match (&key, &raw) {
                     // Avoid eg: \x01 when we can use CTRL-A.
-                    // This also helps to keep the correct sequence for backspace/delete
-                    (KeyCode::Char(c), Some(raw)) if c.is_ascii_control() => (raw.clone(), None),
+                    // This also helps to keep the correct sequence for backspace/delete.
+                    // But take care: on German layouts CTRL-Backslash has unmod="/"
+                    // but chars="\x1c"; we only want to do this transformation when
+                    // chars and unmod have that base ASCII relationship.
+                    // <https://github.com/wez/wezterm/issues/1891>
+                    (KeyCode::Char(c), Some(KeyCode::Char(raw)))
+                        if is_ascii_control(*c) == Some(raw.to_ascii_lowercase()) =>
+                    {
+                        (KeyCode::Char(*raw), None)
+                    }
+                    (KeyCode::Char('\u{7f}'), Some(KeyCode::Char('\u{08}'))) => {
+                        // Special case: macOS reported backspace as \u7f but we set
+                        // the raw keycode and rewrote unmode to \u08 based on the
+                        // vk value above.
+                        // We want to propagate \u08.
+                        (KeyCode::Char('\u{08}'), None)
+                    }
                     _ => (key, raw),
                 }
             };
@@ -2311,7 +2334,6 @@ impl WindowView {
                 key_is_down,
                 raw: Some(raw_key_event),
             }
-            .normalize_ctrl()
             .normalize_shift();
 
             log::debug!(
@@ -2327,6 +2349,35 @@ impl WindowView {
                 inner.ime_last_event.take();
                 inner.events.dispatch(WindowEvent::KeyEvent(event));
             }
+        }
+    }
+
+    extern "C" fn perform_key_equivalent(this: &mut Object, _sel: Sel, nsevent: id) -> BOOL {
+        let chars = unsafe { nsstring_to_str(nsevent.characters()) };
+        let modifier_flags = unsafe { nsevent.modifierFlags() };
+        let modifiers = key_modifiers(modifier_flags);
+
+        log::trace!(
+            "perform_key_equivalent: chars=`{}` modifiers=`{:?}`",
+            chars.escape_debug(),
+            modifiers,
+        );
+
+        if (chars == "." && modifiers == Modifiers::SUPER)
+            || (chars == "\u{1b}" && modifiers == Modifiers::CTRL)
+            || (chars == "\t" && modifiers == Modifiers::CTRL)
+        {
+            // Synthesize a key down event for this, because macOS will
+            // not do that, even though we tell it that we handled this event.
+            // <https://github.com/wez/wezterm/issues/1867>
+            Self::key_common(this, nsevent, true);
+
+            // Prevent macOS from calling doCommandBySelector(cancel:)
+            YES
+        } else {
+            // Allow macOS to process built-in shortcuts like CMD-`
+            // to cycle though windows
+            NO
         }
     }
 
@@ -2429,6 +2480,42 @@ impl WindowView {
 
             inner.events.dispatch(WindowEvent::NeedRepaint);
         }
+    }
+
+    extern "C" fn dragging_entered(this: &mut Object, _: Sel, sender: id) -> BOOL {
+        if let Some(this) = Self::get_this(this) {
+            let mut inner = this.inner.borrow_mut();
+
+            let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
+            let filenames =
+                unsafe { NSPasteboard::propertyListForType(pb, appkit::NSFilenamesPboardType) };
+            let paths = unsafe { filenames.iter() }
+                .map(|file| unsafe {
+                    let path = nsstring_to_str(file);
+                    PathBuf::from(path)
+                })
+                .collect::<Vec<_>>();
+            inner.events.dispatch(WindowEvent::DraggedFile(paths));
+        }
+        YES
+    }
+
+    extern "C" fn perform_drag_operation(this: &mut Object, _: Sel, sender: id) -> BOOL {
+        if let Some(this) = Self::get_this(this) {
+            let mut inner = this.inner.borrow_mut();
+
+            let pb: id = unsafe { msg_send![sender, draggingPasteboard] };
+            let filenames =
+                unsafe { NSPasteboard::propertyListForType(pb, appkit::NSFilenamesPboardType) };
+            let paths = unsafe { filenames.iter() }
+                .map(|file| unsafe {
+                    let path = nsstring_to_str(file);
+                    PathBuf::from(path)
+                })
+                .collect::<Vec<_>>();
+            inner.events.dispatch(WindowEvent::DroppedFile(paths));
+        }
+        YES
     }
 
     fn get_this(this: &Object) -> Option<&mut Self> {
@@ -2590,6 +2677,11 @@ impl WindowView {
             );
 
             cls.add_method(
+                sel!(performKeyEquivalent:),
+                Self::perform_key_equivalent as extern "C" fn(&mut Object, Sel, id) -> BOOL,
+            );
+
+            cls.add_method(
                 sel!(acceptsFirstResponder),
                 Self::accepts_first_responder as extern "C" fn(&mut Object, Sel) -> BOOL,
             );
@@ -2661,8 +2753,124 @@ impl WindowView {
                 Self::first_rect_for_character_range
                     as extern "C" fn(&mut Object, Sel, NSRange, NSRangePointer) -> NSRect,
             );
+            cls.add_method(
+                sel!(draggingEntered:),
+                Self::dragging_entered as extern "C" fn(&mut Object, Sel, id) -> BOOL,
+            );
+            cls.add_method(
+                sel!(performDragOperation:),
+                Self::perform_drag_operation as extern "C" fn(&mut Object, Sel, id) -> BOOL,
+            );
         }
 
         cls.register()
     }
+}
+
+struct ResolvedGeometry {
+    pos: Option<NSPoint>,
+    width: f32,
+    height: f32,
+}
+
+fn screen_backing_frame(screen: *mut Object) -> NSRect {
+    unsafe {
+        let frame = NSScreen::frame(screen);
+        NSScreen::convertRectToBacking_(screen, frame)
+    }
+}
+
+fn resolve_geom(geometry: RequestedWindowGeometry) -> ResolvedGeometry {
+    let rect = match geometry.origin {
+        GeometryOrigin::MainScreen => unsafe {
+            // The screen with the menu bar is always index 0
+            let screens = NSScreen::screens(nil);
+            let screen = screens.objectAtIndex(0);
+            screen_backing_frame(screen)
+        },
+        GeometryOrigin::ActiveScreen => {
+            // The active screen is known as the "main" screen in macOS
+            screen_backing_frame(unsafe { NSScreen::mainScreen(nil) })
+        }
+        GeometryOrigin::Named(name) => unsafe {
+            let screens = NSScreen::screens(nil);
+            let mut matched = screens.objectAtIndex(0);
+            let mut found = false;
+            let mut all_names = vec![];
+            for idx in 0..screens.count() {
+                let screen = screens.objectAtIndex(idx);
+                let screen_name = nsstring_to_str(msg_send!(screen, localizedName));
+                all_names.push(screen_name.clone());
+
+                if screen_name == name {
+                    matched = screen;
+                    found = true;
+                    break;
+                }
+            }
+            log::trace!("Displays: {:?}", all_names);
+            if !found {
+                log::warn!(
+                    "Did not found display named {}, using \
+                     primary instead. Available displays: {:?}",
+                    name,
+                    all_names
+                );
+            }
+            screen_backing_frame(matched)
+        },
+        GeometryOrigin::ScreenCoordinateSystem => unsafe {
+            let mut left: f64 = 0.;
+            let mut top: f64 = 0.;
+            let mut right: f64 = 0.;
+            let mut bottom: f64 = 0.;
+
+            let screens = NSScreen::screens(nil);
+            for idx in 0..screens.count() {
+                let screen = screens.objectAtIndex(idx);
+
+                let frame = screen_backing_frame(screen);
+
+                left = left.min(frame.origin.x);
+                top = top.min(frame.origin.y);
+                right = right.max(frame.origin.x + frame.size.width);
+                bottom = bottom.max(frame.origin.y + frame.size.height);
+            }
+
+            NSRect::new(
+                NSPoint::new(left, top),
+                NSSize::new(right - left, bottom - top),
+            )
+        },
+    };
+
+    let width_context = DimensionContext {
+        dpi: crate::DEFAULT_DPI as f32,
+        pixel_max: rect.size.width as f32,
+        pixel_cell: rect.size.width as f32,
+    };
+    let height_context = DimensionContext {
+        dpi: crate::DEFAULT_DPI as f32,
+        pixel_max: rect.size.height as f32,
+        pixel_cell: rect.size.height as f32,
+    };
+    let width = geometry.width.evaluate_as_pixels(width_context);
+    let height = geometry.height.evaluate_as_pixels(height_context);
+
+    let x_origin = rect.origin.x as f32;
+    let y_origin = rect.origin.y as f32;
+
+    let pos = match (geometry.x, geometry.y) {
+        (Some(x), Some(y)) => {
+            let x = x.evaluate_as_pixels(width_context) + x_origin;
+            let y = y.evaluate_as_pixels(height_context) + y_origin;
+
+            Some(screen_point_to_cartesian(ScreenPoint::new(
+                x as isize, y as isize,
+            )))
+        }
+        _ => None,
+    };
+
+    ResolvedGeometry { pos, width, height }
 }

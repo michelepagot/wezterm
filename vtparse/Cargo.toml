@@ -1,7 +1,7 @@
 [package]
 authors = ["Wez Furlong <wez@wezfurlong.org>"]
 name = "vtparse"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2018"
 repository = "https://github.com/wez/wezterm"
 description = "Low level escape sequence parser"
@@ -14,4 +14,4 @@ readme = "README.md"
 utf8parse = "0.2"
 
 [dev-dependencies]
-pretty_assertions = "0.6"
+k9 = "0.11"

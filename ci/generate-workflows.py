@@ -27,7 +27,7 @@ def yv(v, depth=0):
 
 
 class Step(object):
-    def render(self, f, env, depth=0):
+    def render(self, f, depth=0):
         raise NotImplementedError(repr(self))
 
 
@@ -38,7 +38,7 @@ class RunStep(Step):
         self.shell = shell
         self.env = env
 
-    def render(self, f, env, depth=0):
+    def render(self, f, depth=0):
         indent = "  " * depth
         f.write(f"{indent}- name: {yv(self.name)}\n")
         if self.env:
@@ -49,11 +49,6 @@ class RunStep(Step):
             f.write(f"{indent}  shell: {self.shell}\n")
 
         run = self.run
-
-        if env:
-            for k, v in env.items():
-                if self.shell == "bash":
-                    run = f"export {k}={v}\n{run}\n"
 
         f.write(f"{indent}  run: {yv(run, depth + 2)}\n")
 
@@ -66,7 +61,7 @@ class ActionStep(Step):
         self.env = env
         self.condition = condition
 
-    def render(self, f, env, depth=0):
+    def render(self, f, depth=0):
         indent = "  " * depth
         f.write(f"{indent}- name: {yv(self.name)}\n")
         f.write(f"{indent}  uses: {self.action}\n")
@@ -105,8 +100,9 @@ class Job(object):
         self.env = env
 
     def render(self, f, depth=0):
+        f.write("\n    steps:\n")
         for s in self.steps:
-            s.render(f, self.env, depth)
+            s.render(f, depth)
 
 
 class Target(object):
@@ -119,6 +115,7 @@ class Target(object):
         rust_target=None,
         continuous_only=False,
         app_image=False,
+        is_tag=False,
     ):
         if not name:
             if container:
@@ -132,6 +129,16 @@ class Target(object):
         self.rust_target = rust_target
         self.continuous_only = continuous_only
         self.app_image = app_image
+        self.env = {}
+        self.is_tag = is_tag
+
+    def render_env(self, f, depth=0):
+        self.global_env()
+        if self.env:
+            indent = "    "
+            f.write(f"{indent}env:\n")
+            for k, v in self.env.items():
+                f.write(f"{indent}  {k}: {yv(v, depth + 3)}\n")
 
     def uses_yum(self):
         if "fedora" in self.name:
@@ -147,6 +154,16 @@ class Target(object):
             return True
         return False
 
+    def uses_apk(self):
+        if "alpine" in self.name:
+            return True
+        return False
+
+    def uses_zypper(self):
+        if "suse" in self.name:
+            return True
+        return False
+
     def needs_sudo(self):
         if not self.container and self.uses_apt():
             return True
@@ -158,14 +175,26 @@ class Target(object):
             installer = "yum"
         elif self.uses_apt():
             installer = "apt-get"
+        elif self.uses_apk():
+            installer = "apk"
+        elif self.uses_zypper():
+            installer = "zypper"
         else:
             return []
         if self.needs_sudo():
             installer = f"sudo -n {installer}"
-        return [RunStep(f"Install {name}", f"{installer} install -y {name}")]
+        if self.uses_apk():
+            return [RunStep(f"Install {name}", f"{installer} add {name}")]
+        else:
+            return [RunStep(f"Install {name}", f"{installer} install -y {name}")]
 
     def install_curl(self):
-        if self.uses_yum() or (self.uses_apt() and self.container):
+        if (
+            self.uses_yum()
+            or self.uses_apk()
+            or self.uses_zypper()
+            or (self.uses_apt() and self.container)
+        ):
             if "centos:stream9" in self.container:
                 return self.install_system_package("curl-minimal")
             else:
@@ -173,11 +202,18 @@ class Target(object):
         return []
 
     def install_openssh_server(self):
-        if self.uses_yum() or (self.uses_apt() and self.container):
-            return [
+        steps = []
+        if (
+            self.uses_yum()
+            or self.uses_zypper()
+            or (self.uses_apt() and self.container)
+        ):
+            steps += [
                 RunStep("Ensure /run/sshd exists", "mkdir -p /run/sshd")
             ] + self.install_system_package("openssh-server")
-        return []
+        if self.uses_apk():
+            steps += self.install_system_package("openssh")
+        return steps
 
     def install_newer_compiler(self):
         steps = []
@@ -213,6 +249,8 @@ class Target(object):
                 pre_reqs = "yum install -y wget curl-devel expat-devel gettext-devel openssl-devel zlib-devel gcc perl-ExtUtils-MakeMaker make"
             elif self.uses_apt():
                 pre_reqs = "apt-get install -y wget libcurl4-openssl-dev libexpat-dev gettext libssl-dev libz-dev gcc libextutils-autoinstall-perl make"
+            elif self.uses_zypper():
+                pre_reqs = "zypper install -y wget libcurl-devel libexpat-devel gettext-tools libopenssl-devel zlib-devel gcc perl-ExtUtils-MakeMaker make"
 
             steps.append(
                 RunStep(
@@ -357,6 +395,31 @@ cargo build --all --release""",
                     f"mv ~/rpmbuild/RPMS/*/*.rpm .",
                 )
             )
+        elif self.uses_apk():
+            steps += [
+                # Add the distro name/version into the filename
+                RunStep(
+                    "Rename APKs",
+                    f"mv ~/packages/wezterm/x86_64/*.apk $(echo ~/packages/wezterm/x86_64/*.apk | sed -e 's/wezterm-/wezterm-{self.name}-/')",
+                ),
+                # Move it to the repo dir
+                RunStep(
+                    "Move APKs",
+                    f"mv ~/packages/wezterm/x86_64/*.apk .",
+                ),
+                # Move and rename the keys
+                RunStep(
+                    "Move APK keys",
+                    f"mv ~/.abuild/*.pub wezterm-{self.name}.pub",
+                ),
+            ]
+        elif self.uses_zypper():
+            steps.append(
+                RunStep(
+                    "Move RPM",
+                    f"mv /usr/src/packages/RPMS/*/*.rpm .",
+                )
+            )
 
         patterns = self.asset_patterns()
         glob = " ".join(patterns)
@@ -365,14 +428,14 @@ cargo build --all --release""",
         return steps + [
             ActionStep(
                 "Upload artifact",
-                action="actions/upload-artifact@v2",
+                action="actions/upload-artifact@v3",
                 params={"name": self.name, "path": paths},
             ),
         ]
 
     def asset_patterns(self):
         patterns = []
-        if self.uses_yum():
+        if self.uses_yum() or self.uses_zypper():
             patterns += ["wezterm-*.rpm"]
         elif "win" in self.name:
             patterns += ["WezTerm-*.zip", "WezTerm-*.exe"]
@@ -380,6 +443,10 @@ cargo build --all --release""",
             patterns += ["WezTerm-*.zip"]
         elif ("ubuntu" in self.name) or ("debian" in self.name):
             patterns += ["wezterm-*.deb", "wezterm-*.xz"]
+        elif "alpine" in self.name:
+            patterns += ["wezterm-*.apk"]
+            if self.is_tag:
+                patterns.append("*.pub")
 
         if self.app_image:
             patterns.append("*src.tar.gz")
@@ -397,6 +464,20 @@ cargo build --all --release""",
                     f"mv ~/rpmbuild/RPMS/*/*.rpm wezterm-nightly-{self.name}.rpm",
                 )
             )
+        elif self.uses_apk():
+            steps.append(
+                RunStep(
+                    "Move APKs",
+                    f"mv ~/packages/wezterm/x86_64/*.apk wezterm-nightly-{self.name}.apk",
+                )
+            )
+        elif self.uses_zypper():
+            steps.append(
+                RunStep(
+                    "Move RPM",
+                    f"mv /usr/src/packages/RPMS/*/*.rpm wezterm-nightly-{self.name}.rpm",
+                )
+            )
 
         patterns = self.asset_patterns()
         glob = " ".join(patterns)
@@ -405,7 +486,7 @@ cargo build --all --release""",
         return steps + [
             ActionStep(
                 "Upload artifact",
-                action="actions/upload-artifact@v2",
+                action="actions/upload-artifact@v3",
                 params={"name": self.name, "path": paths, "retention-days": 5},
             ),
         ]
@@ -419,7 +500,7 @@ cargo build --all --release""",
         return steps + [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v2",
+                action="actions/download-artifact@v3",
                 params={"name": self.name},
             ),
             RunStep(
@@ -438,7 +519,7 @@ cargo build --all --release""",
         return steps + [
             ActionStep(
                 "Download artifact",
-                action="actions/download-artifact@v2",
+                action="actions/download-artifact@v3",
                 params={"name": self.name},
             ),
             RunStep(
@@ -511,10 +592,11 @@ cargo build --all --release""",
         return steps
 
     def global_env(self):
-        env = {}
         if "macos" in self.name:
-            env["MACOSX_DEPLOYMENT_TARGET"] = "10.9"
-        return env
+            self.env["MACOSX_DEPLOYMENT_TARGET"] = "10.9"
+        if "alpine" in self.name:
+            self.env["RUSTFLAGS"] = "-C target-feature=-crt-static"
+        return
 
     def prep_environment(self, cache=True):
         steps = []
@@ -531,8 +613,22 @@ cargo build --all --release""",
                 RunStep("Update APT", f"{sudo}apt update"),
             ]
 
+        if self.uses_zypper():
+            if self.container:
+                steps += [
+                    RunStep(
+                        "Seed GITHUB_PATH to work around possible @action/core bug",
+                        f'echo "$PATH:/bin:/usr/bin" >> $GITHUB_PATH',
+                    ),
+                    RunStep(
+                        "Install lsb-release & util-linux",
+                        "zypper install -y lsb-release util-linux",
+                    ),
+                ]
         if self.container:
-            if ("fedora" in self.container) or ("centos" in self.container):
+            if ("fedora" in self.container) or (
+                ("centos" in self.container) and ("centos7" not in self.container)
+            ):
                 steps += [
                     RunStep(
                         "Install config manager",
@@ -554,6 +650,23 @@ cargo build --all --release""",
                         "dnf config-manager --set-enabled crb",
                     ),
                 ]
+            if "alpine" in self.container:
+                steps += [
+                    RunStep(
+                        "Upgrade system",
+                        "apk upgrade --update-cache",
+                        shell="sh",
+                    ),
+                    RunStep(
+                        "Install CI dependencies",
+                        "apk add nodejs zstd wget bash coreutils tar findutils",
+                        shell="sh",
+                    ),
+                    RunStep(
+                        "Allow root login",
+                        "sed 's/root:!/root:*/g' -i /etc/shadow",
+                    ),
+                ]
         steps += self.install_newer_compiler()
         steps += self.install_git()
         steps += self.install_curl()
@@ -565,9 +678,7 @@ cargo build --all --release""",
                 ]
 
         steps += self.install_openssh_server()
-        steps += [
-            CheckoutStep(),
-        ]
+        steps += self.checkout()
         steps += self.install_rust(cache="mac" not in self.name)
         steps += self.install_system_deps()
         return steps
@@ -578,15 +689,28 @@ cargo build --all --release""",
         steps += self.test_all_release()
         steps += self.package()
         steps += self.upload_artifact()
+
         return (
             Job(
                 runs_on=self.os,
                 container=self.container,
                 steps=steps,
-                env=self.global_env(),
+                env=self.env,
             ),
             None,
         )
+
+    def checkout(self, submodules=True):
+        steps = []
+        if self.container:
+            steps += [
+                RunStep(
+                    "Workaround git permissions issue",
+                    "git config --global --add safe.directory /__w/wezterm/wezterm",
+                )
+            ]
+        steps += [CheckoutStep(submodules=submodules)]
+        return steps
 
     def continuous(self):
         steps = self.prep_environment()
@@ -595,12 +719,11 @@ cargo build --all --release""",
         steps += self.package(trusted=True)
         steps += self.upload_artifact_nightly()
 
-        env = self.global_env()
-        env["BUILD_REASON"] = "Schedule"
+        self.env["BUILD_REASON"] = "Schedule"
 
         uploader = Job(
             runs_on="ubuntu-latest",
-            steps=[CheckoutStep(submodules=False)] + self.upload_asset_nightly(),
+            steps=self.checkout(submodules=False) + self.upload_asset_nightly(),
         )
 
         return (
@@ -608,7 +731,7 @@ cargo build --all --release""",
                 runs_on=self.os,
                 container=self.container,
                 steps=steps,
-                env=env,
+                env=self.env,
             ),
             uploader,
         )
@@ -623,16 +746,15 @@ cargo build --all --release""",
 
         uploader = Job(
             runs_on="ubuntu-latest",
-            steps=[CheckoutStep(submodules=False)] + self.upload_asset_tag(),
+            steps=self.checkout(submodules=False) + self.upload_asset_tag(),
         )
 
-        env = self.global_env()
         return (
             Job(
                 runs_on=self.os,
                 container=self.container,
                 steps=steps,
-                env=env,
+                env=self.env,
             ),
             uploader,
         )
@@ -641,11 +763,13 @@ cargo build --all --release""",
 TARGETS = [
     Target(name="ubuntu:18", os="ubuntu-18.04", app_image=True),
     Target(container="ubuntu:20.04", continuous_only=True),
+    Target(container="ubuntu:22.04", continuous_only=True),
     # debian 8's wayland libraries are too old for wayland-client
     # Target(container="debian:8.11", continuous_only=True, bootstrap_git=True),
     Target(container="debian:9.12", continuous_only=True, bootstrap_git=True),
     Target(container="debian:10.3", continuous_only=True),
     Target(container="debian:11", continuous_only=True),
+    Target(name="centos7", container="quay.io/centos/centos:centos7", bootstrap_git=True),
     Target(name="centos8", container="quay.io/centos/centos:stream8"),
     Target(name="centos9", container="quay.io/centos/centos:stream9"),
     Target(name="macos", os="macos-11"),
@@ -653,12 +777,23 @@ TARGETS = [
     Target(container="fedora:33"),
     Target(container="fedora:34"),
     Target(container="fedora:35"),
+    Target(container="fedora:36"),
+    Target(container="alpine:3.12"),
+    Target(container="alpine:3.13"),
+    Target(container="alpine:3.14"),
+    Target(container="alpine:3.15"),
+    Target(name="opensuse_leap", container="registry.opensuse.org/opensuse/leap:15.3"),
+    Target(
+        name="opensuse_tumbleweed",
+        container="registry.opensuse.org/opensuse/tumbleweed",
+    ),
     Target(name="windows", os="windows-latest", rust_target="x86_64-pc-windows-msvc"),
 ]
 
 
-def generate_actions(namer, jobber, trigger, is_continuous):
+def generate_actions(namer, jobber, trigger, is_continuous, is_tag=False):
     for t in TARGETS:
+        t.is_tag = is_tag
         # if t.continuous_only and not is_continuous:
         #    continue
         name = namer(t).replace(":", "")
@@ -679,9 +814,10 @@ jobs:
   build:
     runs-on: {yv(job.runs_on)}
     {container}
-    steps:
 """
             )
+
+            t.render_env(f)
 
             job.render(f, 3)
 
@@ -695,7 +831,6 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     needs: build
-    steps:
 """
                 )
                 uploader.render(f, 3)
@@ -727,8 +862,10 @@ on:
       - "ci/subst-release-info.py"
       - ".github/workflows/pages.yml"
       - ".github/workflows/verify-pages.yml"
+      - ".github/workflows/no-response.yml"
       - ".github/ISSUE_TEMPLATE/*"
       - "**/*.md"
+      - "**/*.markdown"
 """,
         is_continuous=False,
     )
@@ -753,8 +890,10 @@ on:
       - "ci/subst-release-info.py"
       - ".github/workflows/pages.yml"
       - ".github/workflows/verify-pages.yml"
+      - ".github/workflows/no-response.yml"
       - ".github/ISSUE_TEMPLATE/*"
       - "**/*.md"
+      - "**/*.markdown"
 """,
         is_continuous=True,
     )
@@ -771,6 +910,7 @@ on:
       - "20*"
 """,
         is_continuous=True,
+        is_tag=True,
     )
 
 

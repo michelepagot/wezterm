@@ -14,13 +14,18 @@ on:
       - "ci/subst-release-info.py"
       - ".github/workflows/pages.yml"
       - ".github/workflows/verify-pages.yml"
+      - ".github/workflows/no-response.yml"
       - ".github/ISSUE_TEMPLATE/*"
       - "**/*.md"
+      - "**/*.markdown"
 
 jobs:
   build:
     runs-on: "windows-latest"
     
+    env:
+      BUILD_REASON: "Schedule"
+
     steps:
       - name: "checkout repo"
         uses: actions/checkout@v3
@@ -52,16 +57,12 @@ jobs:
           cargo build --all --release
       - name: "Test (Release mode)"
         shell: bash
-        run: |
-          export BUILD_REASON=Schedule
-          cargo test --all --release
+        run: "cargo test --all --release"
       - name: "Package"
         shell: bash
-        run: |
-          export BUILD_REASON=Schedule
-          bash ci/deploy.sh
+        run: "bash ci/deploy.sh"
       - name: "Upload artifact"
-        uses: actions/upload-artifact@v2
+        uses: actions/upload-artifact@v3
         with:
           name: "windows"
           path: |
@@ -72,11 +73,12 @@ jobs:
   upload:
     runs-on: ubuntu-latest
     needs: build
+
     steps:
       - name: "checkout repo"
         uses: actions/checkout@v3
       - name: "Download artifact"
-        uses: actions/download-artifact@v2
+        uses: actions/download-artifact@v3
         with:
           name: "windows"
       - name: "Upload to Nightly Release"

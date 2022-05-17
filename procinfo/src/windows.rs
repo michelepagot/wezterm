@@ -10,15 +10,14 @@ use ntapi::ntwow64::RTL_USER_PROCESS_PARAMETERS32;
 use std::ffi::OsString;
 use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStringExt;
-use winapi::shared::minwindef::{FILETIME, HMODULE, LPVOID, MAX_PATH};
+use winapi::shared::minwindef::{DWORD, FILETIME, LPVOID, MAX_PATH};
 use winapi::shared::ntdef::{FALSE, NT_SUCCESS};
 use winapi::um::handleapi::CloseHandle;
 use winapi::um::memoryapi::ReadProcessMemory;
-use winapi::um::processthreadsapi::{GetProcessTimes, OpenProcess};
-use winapi::um::psapi::{EnumProcessModulesEx, GetModuleFileNameExW, LIST_MODULES_ALL};
+use winapi::um::processthreadsapi::{GetCurrentProcessId, GetProcessTimes, OpenProcess};
 use winapi::um::shellapi::CommandLineToArgvW;
 use winapi::um::tlhelp32::*;
-use winapi::um::winbase::LocalFree;
+use winapi::um::winbase::{LocalFree, QueryFullProcessImageNameW};
 use winapi::um::winnt::{HANDLE, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
 
 /// Manages a Toolhelp32 snapshot handle
@@ -38,6 +37,13 @@ impl Snapshot {
         ProcIter {
             snapshot: &self,
             first: true,
+        }
+    }
+
+    pub fn entries() -> Vec<PROCESSENTRY32W> {
+        match Self::new() {
+            Some(snapshot) => snapshot.iter().collect(),
+            None => vec![],
         }
     }
 }
@@ -92,44 +98,33 @@ struct ProcParams {
 }
 
 /// A handle to an opened process
-struct ProcHandle(HANDLE);
+struct ProcHandle {
+    pid: u32,
+    proc: HANDLE,
+}
 
 impl ProcHandle {
     pub fn new(pid: u32) -> Option<Self> {
+        if pid == unsafe { GetCurrentProcessId() } {
+            // Avoid the potential for deadlock if we're examining ourselves
+            log::trace!("ProcHandle::new({}): skip because it is my own pid", pid);
+            return None;
+        }
         let options = PROCESS_QUERY_INFORMATION | PROCESS_VM_READ;
+        log::trace!("ProcHandle::new({}): OpenProcess", pid);
         let handle = unsafe { OpenProcess(options, FALSE as _, pid) };
+        log::trace!("ProcHandle::new({}): OpenProcess -> {:?}", pid, handle);
         if handle.is_null() {
             return None;
         }
-        Some(Self(handle))
-    }
-
-    /// Returns the HMODULE for the process
-    fn hmodule(&self) -> Option<HMODULE> {
-        let mut needed = 0;
-        let mut hmod = [0 as HMODULE];
-        let size = std::mem::size_of_val(&hmod);
-        let res = unsafe {
-            EnumProcessModulesEx(
-                self.0,
-                hmod.as_mut_ptr(),
-                size as _,
-                &mut needed,
-                LIST_MODULES_ALL,
-            )
-        };
-        if res == 0 {
-            None
-        } else {
-            Some(hmod[0])
-        }
+        Some(Self { pid, proc: handle })
     }
 
     /// Returns the executable image for the process
     pub fn executable(&self) -> Option<PathBuf> {
-        let hmod = self.hmodule()?;
         let mut buf = [0u16; MAX_PATH + 1];
-        let res = unsafe { GetModuleFileNameExW(self.0, hmod, buf.as_mut_ptr(), buf.len() as _) };
+        let mut len = buf.len() as DWORD;
+        let res = unsafe { QueryFullProcessImageNameW(self.proc, 0, buf.as_mut_ptr(), &mut len) };
         if res == 0 {
             None
         } else {
@@ -142,7 +137,7 @@ impl ProcHandle {
         let mut data = MaybeUninit::<T>::uninit();
         let res = unsafe {
             NtQueryInformationProcess(
-                self.0,
+                self.proc,
                 what,
                 data.as_mut_ptr() as _,
                 std::mem::size_of::<T>() as _,
@@ -161,7 +156,7 @@ impl ProcHandle {
         let mut data = MaybeUninit::<T>::uninit();
         let res = unsafe {
             ReadProcessMemory(
-                self.0,
+                self.proc,
                 addr as _,
                 data.as_mut_ptr() as _,
                 std::mem::size_of::<T>() as _,
@@ -254,20 +249,44 @@ impl ProcHandle {
     }
 
     /// Copies a sized WSTR from the address in the process
-    fn read_process_wchar(&self, ptr: LPVOID, size: usize) -> Option<Vec<u16>> {
-        let mut buf = vec![0u16; size / 2];
+    fn read_process_wchar(&self, ptr: LPVOID, byte_size: usize) -> Option<Vec<u16>> {
+        if byte_size > MAX_PATH * 4 {
+            // Defend against implausibly large paths, just in
+            // case we're reading the wrong offset into a kernel struct
+            return None;
+        }
+
+        let mut buf = vec![0u16; byte_size / 2];
+        let mut bytes_read = 0;
 
         let res = unsafe {
             ReadProcessMemory(
-                self.0,
+                self.proc,
                 ptr as _,
                 buf.as_mut_ptr() as _,
-                size,
-                std::ptr::null_mut(),
+                byte_size,
+                &mut bytes_read,
             )
         };
         if res == 0 {
             return None;
+        }
+
+        // In the unlikely event that we have a short read,
+        // truncate the buffer to fit.
+        let wide_chars_read = bytes_read / 2;
+        buf.resize(wide_chars_read, 0);
+
+        // Ensure that it is NUL terminated
+        match buf.iter().position(|&c| c == 0) {
+            Some(n) => {
+                // Truncate to include existing NUL but no later chars
+                buf.resize(n + 1, 0);
+            }
+            None => {
+                // Add a NUL
+                buf.push(0);
+            }
         }
 
         Some(buf)
@@ -287,7 +306,8 @@ impl ProcHandle {
         let mut kernel = empty();
         let mut user = empty();
 
-        let res = unsafe { GetProcessTimes(self.0, &mut start, &mut exit, &mut kernel, &mut user) };
+        let res =
+            unsafe { GetProcessTimes(self.proc, &mut start, &mut exit, &mut kernel, &mut user) };
         if res == 0 {
             return None;
         }
@@ -317,25 +337,29 @@ fn cmd_line_to_argv(buf: &[u16]) -> Vec<String> {
 
 impl Drop for ProcHandle {
     fn drop(&mut self) {
-        unsafe { CloseHandle(self.0) };
+        log::trace!("ProcHandle::drop(pid={} proc={:?})", self.pid, self.proc);
+        unsafe { CloseHandle(self.proc) };
     }
 }
 
 impl LocalProcessInfo {
     pub fn current_working_dir(pid: u32) -> Option<PathBuf> {
+        log::trace!("current_working_dir({})", pid);
         let proc = ProcHandle::new(pid)?;
         let params = proc.get_params()?;
         Some(params.cwd)
     }
 
     pub fn executable_path(pid: u32) -> Option<PathBuf> {
+        log::trace!("executable_path({})", pid);
         let proc = ProcHandle::new(pid)?;
         proc.executable()
     }
 
     pub fn with_root_pid(pid: u32) -> Option<Self> {
-        let snapshot = Snapshot::new()?;
-        let procs: Vec<_> = snapshot.iter().collect();
+        log::trace!("LocalProcessInfo::with_root_pid({}), getting snapshot", pid);
+        let procs = Snapshot::entries();
+        log::trace!("Got snapshot");
 
         fn build_proc(info: &PROCESSENTRY32W, procs: &[PROCESSENTRY32W]) -> LocalProcessInfo {
             let mut children = HashMap::new();

@@ -7,7 +7,7 @@ use log::{debug, error};
 use num_traits::FromPrimitive;
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
-use termwiz::cell::{grapheme_column_width, Cell, CellAttributes, SemanticType, UnicodeVersion};
+use termwiz::cell::{grapheme_column_width, Cell, CellAttributes, SemanticType};
 use termwiz::escape::csi::{CharacterPath, EraseInDisplay};
 use termwiz::escape::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
@@ -391,6 +391,8 @@ impl<'a> Performer<'a> {
                 }
             }
 
+            ControlCode::Null => {}
+
             _ => log::warn!("unhandled ControlCode {:?}", control),
         }
     }
@@ -557,7 +559,7 @@ impl<'a> Performer<'a> {
                 self.palette.take();
                 self.top_and_bottom_margins = 0..self.screen().physical_rows as VisibleRowIndex;
                 self.left_and_right_margins = 0..self.screen().physical_cols;
-                self.unicode_version = UnicodeVersion(self.config.unicode_version());
+                self.unicode_version = self.config.unicode_version();
                 self.unicode_version_stack.clear();
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
@@ -624,7 +626,7 @@ impl<'a> Performer<'a> {
                 let selection = selection_to_selection(selection);
                 match self.set_clipboard_contents(selection, Some(selection_data)) {
                     Ok(_) => (),
-                    Err(err) => error!("failed to set clipboard in response to OSC 52: {:?}", err),
+                    Err(err) => error!("failed to set clipboard in response to OSC 52: {:#?}", err),
                 }
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
@@ -636,7 +638,7 @@ impl<'a> Performer<'a> {
                     }
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Set(n)) => {
-                    self.unicode_version = UnicodeVersion(n);
+                    self.unicode_version.version = n;
                 }
                 ITermProprietary::UnicodeVersion(ITermUnicodeVersionOp::Push(label)) => {
                     let vers = self.unicode_version;
@@ -818,7 +820,7 @@ impl<'a> Performer<'a> {
                                     // We set the border to the background color; we don't
                                     // have an escape that sets that independently, and this
                                     // way just looks better.
-                                    self.palette_mut().cursor_border = c;
+                                    self.palette_mut().cursor_border = c.into();
                                 }
                                 set_or_query!(cursor_bg)
                             }

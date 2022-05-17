@@ -12,13 +12,67 @@ usually the best available version.
 As features stabilize some brief notes about them will accumulate here.
 
 #### New
+* ssh client now supports `BindAddress`. Thanks to [@gpanders](https://github.com/gpanders)! [#1875](https://github.com/wez/wezterm/pull/1875)
+* [PaneInformation.domain_name](config/lua/PaneInformation.md) and [pane:get_domain_name()](config/lua/pane/get_domain_name.md) which return the name of the domain with which a pane is associated. [#1881](https://github.com/wez/wezterm/issues/1881)
+* You may now use `CTRL-n` and `CTRL-p` (in addition to the up/down arrow and vi motion keys) to change the selected row in the Launcher.  Thanks to [@Junnplus](https://github.com/Junnplus)! [#1880](https://github.com/wez/wezterm/pull/1880)
+* Attaching multiplexer domains now attaches the first window as a tab in the active window, rather than opening a new window. [#1874](https://github.com/wez/wezterm/issues/1874)
+* [AttachDomain](config/lua/keyassignment/AttachDomain.md) and [DetachDomain](config/lua/keyassignment/DetachDomain.md) key assignments
+* Specifying a domain name in a [SpawnCommand](config/lua/SpawnCommand.md) will cause that domain to be attached if it is in the detached state. This is useful when combined with [SwitchToWorkspace](config/lua/keyassignment/SwitchToWorkspace.md).
+* X11: wezterm now sets `_NET_WM_NAME` in addition to `WM_NAME` for clients that don't know how to fallback
+* [treat_east_asian_ambiguous_width_as_wide](config/lua/config/treat_east_asian_ambiguous_width_as_wide.md) for control over how ambiguous width characters are resolved. [#1888](https://github.com/wez/wezterm/issues/1888)
+* [clean_exit_codes](config/lua/config/clean_exit_codes.md) config to fine tune [exit_behavior](config/lua/config/exit_behavior.md) [#1889](https://github.com/wez/wezterm/issues/1889)
+* [ClearSelection](config/lua/keyassignment/ClearSelection.md) key assignment [#1900](https://github.com/wez/wezterm/issues/1900)
+* `wezterm cli list --format json` and `wezterm cli list-clients --format json` allow retrieving data in json format. Thanks to [@ratmice](https://github.com/ratmice)! [#1911](https://github.com/wez/wezterm/pull/1911)
+* macOS, Windows: you may now drag and drop files from other programs and have their paths paste into the terminal. The new [quote_dropped_files](config/lua/config/quote_dropped_files.md) option controls how the file names are quoted. Thanks to [@junnplus](https://github.com/junnplus) and [@datasone](https://github.com/datasone)! [#1868](https://github.com/wez/wezterm/pull/1868) [#1953](https://github.com/wez/wezterm/pull/1953)
+* The mouse scroll wheel now cycles between tabs when hovering over the tab tab. Thanks to [@junnplus](https://github.com/junnplus)! [#1726](https://github.com/wez/wezterm/issues/1726)
+* Holding down `ALT` while dragging the left button will select a rectangular block.  [ExtendSelectionToMouseCursor](config/lua/keyassignment/ExtendSelectionToMouseCursor.md) now accepts `"Block"` as a selection mode. [#1361](https://github.com/wez/wezterm/issues/1361)
+* In Copy Mode, `CTRL-v` will enable rectangular block selection mode. [#1656](https://github.com/wez/wezterm/issues/1656)
+* Copy Mode: key assignments are [now configurable](copymode.md#configurable-key-assignments) [#993](https://github.com/wez/wezterm/issues/993)
+* Search Mode: key assignments are [now configurable](scrollback.md#configurable-key-assignments) [#993](https://github.com/wez/wezterm/issues/993)
+* Copy Mode and Search Mode can be toggled and remember search results and cursor positioning, making it easier to locate and select text without using the mouse [#1592](https://github.com/wez/wezterm/issues/1592)
+* In the Launcher Menu, you may now use `CTRL-G` to cancel/exit the launcher [#1977](https://github.com/wez/wezterm/issues/1977)
+
+#### Updated
+* Bundled harfbuzz to 4.2.1
+
 #### Changed
-* Disabled ligatures for `"Monaco"` and `"Menlo"` fonts, as those ligatures match even for words such as `find`. [#1786](https://github.com/wez/wezterm/issues/1786) [#1736](https://github.com/wez/wezterm/issues/1736)
+* Debian packages now register wezterm as an alternative for `x-terminal-emulator`. Thanks to [@xpufx](https://github.com/xpufx)! [#1883](https://github.com/wez/wezterm/pull/1883)
+* Windows: wezterm will now read the default environment variables from the `HKLM\System\CurrentControlSet\Control\Session Manager\Environment` and `HKCU\Environment` and apply those to the base environment prior to applying `set_environment_variables`. [#1848](https://github.com/wez/wezterm/issues/1848)
+* [Key Table](config/key-tables.md) lookups will now keep searching the activation stack until a matching assignment is found, allowing for layered key tables. [#993](https://github.com/wez/wezterm/issues/993)
+* Search mode's search term is now remembered globally between activations of search mode. [#1912](https://github.com/wez/wezterm/issues/1912)
+
+#### Fixed
+* Flush after replying to XTGETTCAP and DECRQM. [#1850](https://github.com/wez/wezterm/issues/1850) [#1950](https://github.com/wez/wezterm/issues/1950)
+* macOS: CMD-. was treated as CTRL-ESC [#1867](https://github.com/wez/wezterm/issues/1867)
+* macOS: CTRL-Backslash on German layouts was incorrect [#1891](https://github.com/wez/wezterm/issues/1891)
+* `nf-mdi-contacts` nerdfont symbol treated as zero-width [#1864](https://github.com/wez/wezterm/issues/1864)
+* X11/Wayland: CTRL-i, CTRL-j, CTRL-m misinterpreted as CTRL-Tab, CTRL-Enter, CTRL-Return [#1851](https://github.com/wez/wezterm/issues/1851)
+* Scrollbar stopped working after a lot of output scrolled outside of the scrollback limit.  Thanks to [@davidrios](https://github.com/davidrios)! [#1866](https://github.com/wez/wezterm/pull/1866)
+* Windows: uncommitted IME composition could get stuck when switching input methods. [#1922](https://github.com/wez/wezterm/issues/1922)
+* OSC sequences, such as those that change the window or tab title, that accept a single string parameter will now join multiple parameters together. This allows window and tab titles to contain a semicolo. Thanks to [@kumattau](https://github.com/kumattau)! [#1939](https://github.com/wez/wezterm/pull/1939)
+* Unable to use `ALT` as a modifier for the `leader` key. [#1958](https://github.com/wez/wezterm/issues/1958)
+* IME Candidate window position was incorrect. Thanks to [@kumattau](https://github.com/kumattau)! [#1976](https://github.com/wez/wezterm/pull/1976)
+* Prevent panic for some classes of invalid input, found while fuzzing. Thanks to [@5225225](https://github.com/5225225)! [#1990](https://github.com/wez/wezterm/pull/1990) [#1986](https://github.com/wez/wezterm/pull/1986)
+* Detaching an ssh multiplexer domain sometimes killed the associated panes! [#1993](https://github.com/wez/wezterm/issues/1993)
+
+### 20220408-101518-b908e2dd
+
+#### New
+* [Key Tables](config/key-tables.md) feature for powerful modal key assignments
+* `wezterm start --position x,y`, `wezterm start --position displayname:30%,30%` option to control starting window position on all systems except for Wayland. See `wezterm start --help` for more info. [#1794](https://github.com/wez/wezterm/issues/1794)
+#### Changed
+* Default key assignments are `mapped:` again. A new [key_map_preference](config/lua/config/key_map_preference.md) option allows the defaults to use `"Mapped"` or `"Physical"`.
+* Disabled ligatures for `"Monaco"` and `"Menlo"` fonts, as those have `"fi"` ligatures that match even for words such as `find`. [#1786](https://github.com/wez/wezterm/issues/1786) [#1736](https://github.com/wez/wezterm/issues/1736)
+* Removed the `send_composed_key_when_alt_is_pressed` option. When processing generic `ALT` (eg: that has neither left nor right), if either `send_composed_key_when_left_alt_is_pressed` or `send_composed_key_when_right_alt_is_pressed` is true, then the composed form of the key event will be generated.
 #### Updated and Improved
-* Bundled harfbuzz to 4.1.0
+* Bundled harfbuzz to 4.2.0
 * On macOS, non-native fullscreen mode now attempts to avoid the notch on systems that have one. [#1737](https://github.com/wez/wezterm/issues/1737)
 * Sixel parsing performance has been improved
 * You may now [specify a scaling factor per fallback font](config/lua/wezterm/font_with_fallback.md#manual-fallback-scaling), which is useful when your preferred CJK font renders smaller than your Roman primary font, for example.
+* Color schemes: [Retro](colorschemes/r/index.md#retro), [GitHub Dark](colorschemes/g/index.md#github-dark), [Blazer](colorschemes/b/index.md#blazer)
+* Wayland: touchpad scroll is now more responsive/precise. Thanks to [@davidrios](https://github.com/davidrios)! [#1800](https://github.com/wez/wezterm/pull/1800) [#1840](https://github.com/wez/wezterm/pull/1840)
+* Kitty image protocol: now also supports shared memory data transmission. Thanks to [@tantei3](https://github.com/tantei3)! [#1810](https://github.com/wez/wezterm/pull/1810)
+* Secondary DA response bumped up to persuade vim to set `ttymouse=sgr` by default. [#1825](https://github.com/wez/wezterm/issues/1825)
 
 #### Fixed
 * Incorrect csi-u encoding with non-ascii characters. [#1746](https://github.com/wez/wezterm/issues/1746)
@@ -37,6 +91,13 @@ As features stabilize some brief notes about them will accumulate here.
 * Multiplexer performance with images was unusuable for all but tiny images. [#1237](https://github.com/wez/wezterm/issues/1237)
 * `CloseCurrentPane{confirm=false}` would leave behind a phantom tab/pane when used with the multiplexer. [#1277](https://github.com/wez/wezterm/issues/1277)
 * `CloseCurrentPane{confirm=true}` artifacts when used with the multiplexer. [#783](https://github.com/wez/wezterm/issues/783)
+* Scrollbar thumb could jump around/move out of bounds. Thanks to [@davidrios](https://github.com/davidrios)! [#1525](https://github.com/wez/wezterm/issues/1525)
+* OSC 52 could stop working for tabs/panes spawned into the GUI via the CLI. [#1790](https://github.com/wez/wezterm/issues/1790)
+* Workaround for fonts with broken horizontal advance metrics [#1787](https://github.com/wez/wezterm/issues/1787)
+* Improved mouse based selection. Thanks to [@davidrios](https://github.com/davidrios)! [#1805](https://github.com/wez/wezterm/issues/1805) [#1199](https://github.com/wez/wezterm/issues/1199) [#1386](https://github.com/wez/wezterm/issues/1386) [#354](https://github.com/wez/wezterm/issues/354)
+* X11 `KP_End` wasn't recognized [#1804](https://github.com/wez/wezterm/issues/1804)
+* fontconfig matches now also treat `"charcell"` spacing as monospace. [#1820](https://github.com/wez/wezterm/issues/1820)
+* Multiplexer render update laggy, especially when using multiple windows. [#1814](https://github.com/wez/wezterm/issues/1814) [#1841](https://github.com/wez/wezterm/issues/1841)
 
 ### 20220319-142410-0fcdea07
 

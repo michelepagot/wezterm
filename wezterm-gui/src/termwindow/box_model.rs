@@ -2,9 +2,8 @@
 use crate::color::LinearRgba;
 use crate::customglyph::{BlockKey, Poly};
 use crate::glyphcache::CachedGlyph;
-use crate::termwindow::render::rgbcolor_to_window_color;
 use crate::termwindow::{
-    MappedQuads, RenderState, SrgbTexture2d, TermWindowNotif, UIItem, UIItemType,
+    MappedQuads, MouseCapture, RenderState, SrgbTexture2d, TermWindowNotif, UIItem, UIItemType,
 };
 use crate::utilsprites::RenderMetrics;
 use ::window::{RectF, WindowOps};
@@ -265,13 +264,17 @@ impl Element {
                     bg: if cluster.attrs.background() == ColorAttribute::Default {
                         InheritableColor::Inherited
                     } else {
-                        rgbcolor_to_window_color(palette.resolve_bg(cluster.attrs.background()))
+                        palette
+                            .resolve_bg(cluster.attrs.background())
+                            .to_linear()
                             .into()
                     },
                     text: if cluster.attrs.foreground() == ColorAttribute::Default {
                         InheritableColor::Inherited
                     } else {
-                        rgbcolor_to_window_color(palette.resolve_fg(cluster.attrs.foreground()))
+                        palette
+                            .resolve_fg(cluster.attrs.foreground())
+                            .to_linear()
                             .into()
                     },
                 });
@@ -756,17 +759,18 @@ impl super::TermWindow {
     ) -> anyhow::Result<()> {
         let colors = match &element.hover_colors {
             Some(hc) => {
-                let hovering = match &self.current_mouse_event {
-                    Some(event) => {
-                        let mouse_x = event.coords.x as f32;
-                        let mouse_y = event.coords.y as f32;
-                        mouse_x >= element.bounds.min_x()
-                            && mouse_x <= element.bounds.max_x()
-                            && mouse_y >= element.bounds.min_y()
-                            && mouse_y <= element.bounds.max_y()
-                    }
-                    None => false,
-                };
+                let hovering =
+                    match &self.current_mouse_event {
+                        Some(event) => {
+                            let mouse_x = event.coords.x as f32;
+                            let mouse_y = event.coords.y as f32;
+                            mouse_x >= element.bounds.min_x()
+                                && mouse_x <= element.bounds.max_x()
+                                && mouse_y >= element.bounds.min_y()
+                                && mouse_y <= element.bounds.max_y()
+                        }
+                        None => false,
+                    } && matches!(self.current_mouse_capture, None | Some(MouseCapture::UI));
                 if hovering {
                     hc
                 } else {

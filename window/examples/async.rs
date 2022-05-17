@@ -1,4 +1,5 @@
 use ::window::*;
+use config::Dimension;
 use promise::spawn::spawn;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -81,6 +82,8 @@ impl MyWindow {
             | WindowEvent::AdviseDeadKeyStatus(_)
             | WindowEvent::Notification(_)
             | WindowEvent::FocusChanged(_)
+            | WindowEvent::DraggedFile(_)
+            | WindowEvent::DroppedFile(_)
             | WindowEvent::MouseLeave => {}
         }
     }
@@ -107,8 +110,11 @@ async fn spawn_window() -> Result<(), Box<dyn std::error::Error>> {
     let win = Window::new_window(
         "myclass",
         "the title",
-        800,
-        600,
+        RequestedWindowGeometry {
+            width: Dimension::Pixels(800.),
+            height: Dimension::Pixels(600.),
+            ..Default::default()
+        },
         None,
         fontconfig,
         move |event, window| {

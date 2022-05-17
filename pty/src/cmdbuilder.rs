@@ -37,7 +37,8 @@ impl EnvEntry {
 }
 
 fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
-    std::env::vars_os()
+    #[allow(unused_mut)]
+    let mut env: BTreeMap<OsString, EnvEntry> = std::env::vars_os()
         .map(|(key, value)| {
             (
                 EnvEntry::map_key(key.clone()),
@@ -48,7 +49,101 @@ fn get_base_env() -> BTreeMap<OsString, EnvEntry> {
                 },
             )
         })
-        .collect()
+        .collect();
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStringExt;
+        use winapi::um::processenv::ExpandEnvironmentStringsW;
+        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+        use winreg::types::FromRegValue;
+        use winreg::{RegKey, RegValue};
+
+        fn reg_value_to_string(value: &RegValue) -> anyhow::Result<OsString> {
+            match value.vtype {
+                RegType::REG_EXPAND_SZ => {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            value.bytes.as_ptr() as *const u16,
+                            value.bytes.len() / 2,
+                        )
+                    };
+                    let size =
+                        unsafe { ExpandEnvironmentStringsW(src.as_ptr(), std::ptr::null_mut(), 0) };
+                    let mut buf = vec![0u16; size as usize + 1];
+                    unsafe {
+                        ExpandEnvironmentStringsW(src.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
+                    };
+
+                    let mut buf = buf.as_slice();
+                    while let Some(0) = buf.last() {
+                        buf = &buf[0..buf.len() - 1];
+                    }
+                    Ok(OsString::from_wide(buf))
+                }
+                _ => Ok(OsString::from_reg_value(value)?),
+            }
+        }
+
+        if let Ok(sys_env) = RegKey::predef(HKEY_LOCAL_MACHINE)
+            .open_subkey("System\\CurrentControlSet\\Control\\Session Manager\\Environment")
+        {
+            for res in sys_env.enum_values() {
+                if let Ok((name, value)) = res {
+                    if name.to_ascii_lowercase() == "username" {
+                        continue;
+                    }
+                    if let Ok(value) = reg_value_to_string(&value) {
+                        log::trace!("adding SYS env: {:?} {:?}", name, value);
+                        env.insert(
+                            EnvEntry::map_key(name.clone().into()),
+                            EnvEntry {
+                                is_from_base_env: true,
+                                preferred_key: name.into(),
+                                value,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Ok(sys_env) = RegKey::predef(HKEY_CURRENT_USER).open_subkey("Environment") {
+            for res in sys_env.enum_values() {
+                if let Ok((name, value)) = res {
+                    if let Ok(value) = reg_value_to_string(&value) {
+                        // Merge the system and user paths together
+                        let value = if name.to_ascii_lowercase() == "path" {
+                            match env.get(&EnvEntry::map_key(name.clone().into())) {
+                                Some(entry) => {
+                                    let mut result = OsString::new();
+                                    result.push(&entry.value);
+                                    result.push(";");
+                                    result.push(&value);
+                                    result
+                                }
+                                None => value,
+                            }
+                        } else {
+                            value
+                        };
+
+                        log::trace!("adding USER env: {:?} {:?}", name, value);
+                        env.insert(
+                            EnvEntry::map_key(name.clone().into()),
+                            EnvEntry {
+                                is_from_base_env: true,
+                                preferred_key: name.into(),
+                                value,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    env
 }
 
 /// `CommandBuilder` is used to prepare a command to be spawned into a pty.
@@ -318,7 +413,7 @@ impl CommandBuilder {
     /// Determine which shell to run.
     /// We take the contents of the $SHELL env var first, then
     /// fall back to looking it up from the password database.
-    fn get_shell(&self) -> anyhow::Result<String> {
+    pub fn get_shell(&self) -> anyhow::Result<String> {
         if let Some(shell) = self.get_env("SHELL").and_then(OsStr::to_str) {
             return Ok(shell.into());
         }
@@ -436,6 +531,16 @@ impl CommandBuilder {
         block.push(0);
 
         block
+    }
+
+    pub fn get_shell(&self) -> anyhow::Result<String> {
+        let exe: OsString = self
+            .get_env("ComSpec")
+            .unwrap_or(OsStr::new("cmd.exe"))
+            .into();
+        Ok(exe
+            .into_string()
+            .unwrap_or_else(|_| "%CompSpec%".to_string()))
     }
 
     pub(crate) fn cmdline(&self) -> anyhow::Result<(Vec<u16>, Vec<u16>)> {

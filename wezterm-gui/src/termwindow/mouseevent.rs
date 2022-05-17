@@ -1,6 +1,6 @@
 use crate::tabbar::TabBarItem;
 use crate::termwindow::keyevent::window_mods_to_termwiz_mods;
-use crate::termwindow::{PositionedSplit, ScrollHit, UIItem, UIItemType, TMB};
+use crate::termwindow::{MouseCapture, PositionedSplit, ScrollHit, UIItem, UIItemType, TMB};
 use ::window::{
     MouseButtons as WMB, MouseCursor, MouseEvent, MouseEventKind as WMEK, MousePress, WindowOps,
     WindowState,
@@ -67,7 +67,7 @@ impl super::TermWindow {
             self.tab_bar_pixel_height().unwrap_or(0.) as isize
         } else {
             0
-        } + border.top.get();
+        } + border.top.get() as isize;
 
         let (padding_left, padding_top) = self.padding_left_top();
 
@@ -90,21 +90,27 @@ impl super::TermWindow {
         }
         .trunc() as usize;
 
-        let y_pixel_offset = (event
+        let mut y_pixel_offset = event
             .coords
             .y
             .sub(padding_top as isize)
-            .sub(first_line_offset)
-            .max(0)
-            % self.render_metrics.cell_size.height) as usize;
+            .sub(first_line_offset);
+        if y > 0 {
+            y_pixel_offset = y_pixel_offset.max(0) % self.render_metrics.cell_size.height;
+        }
 
-        let x_pixel_offset = (event.coords.x.sub(padding_left as isize).max(0)
-            % self.render_metrics.cell_size.width) as usize;
+        let mut x_pixel_offset = event.coords.x.sub(padding_left as isize);
+        if x > 0 {
+            x_pixel_offset = x_pixel_offset.max(0) % self.render_metrics.cell_size.width;
+        }
 
         self.last_mouse_coords = (x, y);
 
+        let mut capture_mouse = false;
+
         match event.kind {
             WMEK::Release(ref press) => {
+                self.current_mouse_capture = None;
                 self.current_mouse_buttons.retain(|p| p != press);
                 if press == &MousePress::Left && self.window_drag_position.take().is_some() {
                     // Completed a window drag
@@ -117,6 +123,8 @@ impl super::TermWindow {
             }
 
             WMEK::Press(ref press) => {
+                capture_mouse = true;
+
                 // Perform click counting
                 let button = mouse_press_to_tmb(press);
 
@@ -166,28 +174,40 @@ impl super::TermWindow {
             _ => {}
         }
 
-        let ui_item = self.resolve_ui_item(&event);
+        let ui_item = if matches!(self.current_mouse_capture, None | Some(MouseCapture::UI)) {
+            let ui_item = self.resolve_ui_item(&event);
 
-        match (self.last_ui_item.take(), &ui_item) {
-            (Some(prior), Some(item)) => {
-                self.leave_ui_item(&prior);
-                self.enter_ui_item(item);
-                context.invalidate();
+            match (self.last_ui_item.take(), &ui_item) {
+                (Some(prior), Some(item)) => {
+                    self.leave_ui_item(&prior);
+                    self.enter_ui_item(item);
+                    context.invalidate();
+                }
+                (Some(prior), None) => {
+                    self.leave_ui_item(&prior);
+                    context.invalidate();
+                }
+                (None, Some(item)) => {
+                    self.enter_ui_item(item);
+                    context.invalidate();
+                }
+                (None, None) => {}
             }
-            (Some(prior), None) => {
-                self.leave_ui_item(&prior);
-                context.invalidate();
-            }
-            (None, Some(item)) => {
-                self.enter_ui_item(item);
-                context.invalidate();
-            }
-            (None, None) => {}
-        }
+
+            ui_item
+        } else {
+            None
+        };
 
         if let Some(item) = ui_item {
+            if capture_mouse {
+                self.current_mouse_capture = Some(MouseCapture::UI);
+            }
             self.mouse_event_ui_item(item, pane, y, event, context);
-        } else {
+        } else if matches!(
+            self.current_mouse_capture,
+            None | Some(MouseCapture::TerminalPane(_))
+        ) {
             self.mouse_event_terminal(
                 pane,
                 ClickPosition {
@@ -198,6 +218,7 @@ impl super::TermWindow {
                 },
                 event,
                 context,
+                capture_mouse,
             );
         }
     }
@@ -252,8 +273,26 @@ impl super::TermWindow {
         let dims = pane.get_dimensions();
         let current_viewport = self.get_viewport(pane.pane_id());
 
+        let tab_bar_height = if self.show_tab_bar {
+            self.tab_bar_pixel_height().unwrap_or(0.)
+        } else {
+            0.
+        };
+        let (top_bar_height, bottom_bar_height) = if self.config.tab_bar_at_bottom {
+            (0.0, tab_bar_height)
+        } else {
+            (tab_bar_height, 0.0)
+        };
+
+        let border = self.get_os_border();
+        let y_offset = top_bar_height + border.top.get() as f32;
+
         let from_top = start_event.coords.y.saturating_sub(item.y as isize);
-        let effective_thumb_top = event.coords.y.saturating_sub(from_top).max(0) as usize;
+        let effective_thumb_top = event
+            .coords
+            .y
+            .saturating_sub(y_offset as isize + from_top)
+            .max(0) as usize;
 
         // Convert thumb top into a row index by reversing the math
         // in ScrollHit::thumb
@@ -261,9 +300,10 @@ impl super::TermWindow {
             effective_thumb_top,
             &*pane,
             current_viewport,
-            &self.dimensions,
-            self.tab_bar_pixel_height().unwrap_or(0.),
-            self.config.tab_bar_at_bottom,
+            self.dimensions.pixel_height.saturating_sub(
+                y_offset as usize + border.bottom.get() + bottom_bar_height as usize,
+            ),
+            (self.render_metrics.cell_size.height as f32 / 2.0) as usize,
         );
         self.set_viewport(pane.pane_id(), Some(row), dims);
         context.invalidate();
@@ -385,6 +425,10 @@ impl super::TermWindow {
                 }
                 _ => {}
             },
+            WMEK::VertWheel(n) => {
+                self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true)
+                    .ok();
+            }
             _ => {}
         }
         self.update_title_post_status();
@@ -479,17 +523,28 @@ impl super::TermWindow {
         position: ClickPosition,
         event: MouseEvent,
         context: &dyn WindowOps,
+        capture_mouse: bool,
     ) {
         let mut is_click_to_focus_pane = false;
 
-        let mut x = position.column;
-        let mut y = position.row;
+        let ClickPosition {
+            mut column,
+            mut row,
+            mut x_pixel_offset,
+            mut y_pixel_offset,
+        } = position;
+
+        let is_already_captured = matches!(
+            self.current_mouse_capture,
+            Some(MouseCapture::TerminalPane(_))
+        );
 
         for pos in self.get_panes_to_render() {
-            if y >= pos.top as i64
-                && y <= (pos.top + pos.height) as i64
-                && x >= pos.left
-                && x <= pos.left + pos.width
+            if !is_already_captured
+                && row >= pos.top as i64
+                && row <= (pos.top + pos.height) as i64
+                && column >= pos.left
+                && column <= pos.left + pos.width
             {
                 if pane.pane_id() != pos.pane.pane_id() {
                     // We're over a pane that isn't active
@@ -521,10 +576,28 @@ impl super::TermWindow {
                         }
                     }
                 }
-                x = x.saturating_sub(pos.left);
-                y = y.saturating_sub(pos.top as i64);
+                column = column.saturating_sub(pos.left);
+                row = row.saturating_sub(pos.top as i64);
+                break;
+            } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
+                column = column.saturating_sub(pos.left);
+                row = row.saturating_sub(pos.top as i64).max(0);
+
+                if position.column < pos.left {
+                    x_pixel_offset -= self.render_metrics.cell_size.width
+                        * (pos.left as isize - position.column as isize);
+                }
+                if position.row < pos.top as i64 {
+                    y_pixel_offset -= self.render_metrics.cell_size.height
+                        * (pos.top as isize - position.row as isize);
+                }
+
                 break;
             }
+        }
+
+        if capture_mouse {
+            self.current_mouse_capture = Some(MouseCapture::TerminalPane(pane.pane_id()));
         }
 
         let is_focused = if let Some(focused) = self.focused.as_ref() {
@@ -570,11 +643,19 @@ impl super::TermWindow {
         let stable_row = self
             .get_viewport(pane.pane_id())
             .unwrap_or(dims.physical_top)
-            + y as StableRowIndex;
+            + row as StableRowIndex;
 
         self.pane_state(pane.pane_id())
             .mouse_terminal_coords
-            .replace((x, stable_row));
+            .replace((
+                ClickPosition {
+                    column,
+                    row,
+                    x_pixel_offset,
+                    y_pixel_offset,
+                },
+                stable_row,
+            ));
 
         let (top, mut lines) = pane.get_lines_with_hyperlinks_applied(
             stable_row..stable_row + 1,
@@ -582,7 +663,7 @@ impl super::TermWindow {
         );
         let new_highlight = if top == stable_row {
             if let Some(line) = lines.get_mut(0) {
-                if let Some(cell) = line.cells().get(x) {
+                if let Some(cell) = line.cells().get(column) {
                     cell.attrs().hyperlink().cloned()
                 } else {
                     None
@@ -742,10 +823,10 @@ impl super::TermWindow {
                 }
                 WMEK::HorzWheel(_) => TMB::None,
             },
-            x,
-            y,
-            x_pixel_offset: position.x_pixel_offset,
-            y_pixel_offset: position.y_pixel_offset,
+            x: column,
+            y: row,
+            x_pixel_offset,
+            y_pixel_offset,
             modifiers: window_mods_to_termwiz_mods(event.modifiers),
         };
 
