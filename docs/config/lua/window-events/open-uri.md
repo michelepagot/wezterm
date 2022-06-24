@@ -6,8 +6,9 @@ key/mouse assignment is triggered.
 The default action is to open the active URI in your browser, but if you
 register for this event you can co-opt the default behavior.
 
-For example, if you prefer to launch your preferred MUA in a new window
-in response to clicking on `mailto:` URLs, you could do something like:
+For example, if you prefer to launch your preferred Mail User Agent
+in a new window in response to clicking on `mailto:` URLs,
+you could do something like:
 
 ```lua
 local wezterm = require 'wezterm';
