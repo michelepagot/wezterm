@@ -1,7 +1,7 @@
 use crate::termwindow::TermWindowNotif;
 use crate::TermWindow;
 use ::window::*;
-use anyhow::Error;
+use anyhow::{Context, Error};
 pub use config::FrontEndSelection;
 use mux::client::ClientId;
 use mux::window::WindowId as MuxWindowId;
@@ -87,7 +87,10 @@ impl GuiFrontEnd {
                         alert:
                             Alert::OutputSinceFocusLost
                             | Alert::PaletteChanged
-                            | Alert::TitleMaybeChanged
+                            | Alert::CurrentWorkingDirectoryChanged
+                            | Alert::WindowTitleChanged(_)
+                            | Alert::TabTitleChanged(_)
+                            | Alert::IconTitleChanged(_)
                             | Alert::SetUserVar { .. },
                     } => {}
                     MuxNotification::Empty => {
@@ -142,7 +145,9 @@ impl GuiFrontEnd {
     }
 
     pub fn run_forever(&self) -> anyhow::Result<()> {
-        self.connection.run_message_loop()
+        self.connection
+            .run_message_loop()
+            .context("running message loop")
     }
 
     pub fn reconcile_workspace(&self) {
@@ -275,6 +280,10 @@ impl GuiFrontEnd {
 
 thread_local! {
     static FRONT_END: RefCell<Option<Rc<GuiFrontEnd>>> = RefCell::new(None);
+}
+
+pub fn try_front_end() -> Option<Rc<GuiFrontEnd>> {
+    FRONT_END.with(|f| f.borrow().as_ref().map(Rc::clone))
 }
 
 pub fn front_end() -> Rc<GuiFrontEnd> {

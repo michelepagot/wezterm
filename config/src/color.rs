@@ -1,17 +1,18 @@
-use crate::lua::{format_as_escapes, FormatItem};
 use crate::*;
-use luahelper::impl_lua_conversion;
+use luahelper::impl_lua_conversion_dynamic;
+use std::convert::TryFrom;
 use std::str::FromStr;
 use termwiz::cell::CellAttributes;
 pub use termwiz::color::{ColorSpec, RgbColor, SrgbaTuple};
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 
-#[derive(Debug, Copy, Deserialize, Serialize, Clone)]
+#[derive(Debug, Copy, Clone, FromDynamic, ToDynamic)]
 pub struct HsbTransform {
-    #[serde(default = "default_one_point_oh")]
+    #[dynamic(default = "default_one_point_oh")]
     pub hue: f32,
-    #[serde(default = "default_one_point_oh")]
+    #[dynamic(default = "default_one_point_oh")]
     pub saturation: f32,
-    #[serde(default = "default_one_point_oh")]
+    #[dynamic(default = "default_one_point_oh")]
     pub brightness: f32,
 }
 
@@ -25,30 +26,10 @@ impl Default for HsbTransform {
     }
 }
 
-fn de_indexed<'de, D>(deserializer: D) -> Result<HashMap<u8, RgbaColor>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    struct Wrap(HashMap<String, RgbaColor>);
-    let Wrap(map) = Wrap::deserialize(deserializer)?;
-
-    Ok(map
-        .into_iter()
-        .filter_map(|(k, v)| match k.parse::<u8>() {
-            Ok(n) if n >= 16 => Some((n, v)),
-            _ => {
-                log::warn!("Ignoring invalid color key {}", k);
-                None
-            }
-        })
-        .collect())
-}
-
-#[derive(Default, Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, FromDynamic, ToDynamic)]
+#[dynamic(try_from = "String", into = "String")]
 pub struct RgbaColor {
-    #[serde(flatten)]
+    #[dynamic(flatten)]
     color: SrgbaTuple,
 }
 
@@ -60,10 +41,22 @@ impl From<RgbColor> for RgbaColor {
     }
 }
 
+impl From<SrgbaTuple> for RgbaColor {
+    fn from(color: SrgbaTuple) -> Self {
+        Self { color }
+    }
+}
+
 impl std::ops::Deref for RgbaColor {
     type Target = SrgbaTuple;
     fn deref(&self) -> &SrgbaTuple {
         &self.color
+    }
+}
+
+impl Into<String> for &RgbaColor {
+    fn into(self) -> String {
+        self.color.to_rgb_string()
     }
 }
 
@@ -79,7 +72,7 @@ impl Into<SrgbaTuple> for RgbaColor {
     }
 }
 
-impl std::convert::TryFrom<String> for RgbaColor {
+impl TryFrom<String> for RgbaColor {
     type Error = anyhow::Error;
     fn try_from(s: String) -> anyhow::Result<RgbaColor> {
         Ok(RgbaColor {
@@ -89,7 +82,7 @@ impl std::convert::TryFrom<String> for RgbaColor {
     }
 }
 
-#[derive(Default, Debug, Deserialize, Serialize, Clone)]
+#[derive(Default, Debug, Clone, FromDynamic, ToDynamic)]
 pub struct Palette {
     /// The text color to use when the attributes are reset to default
     pub foreground: Option<RgbaColor>,
@@ -109,7 +102,7 @@ pub struct Palette {
     pub brights: Option<[RgbaColor; 8]>,
     /// A map for setting arbitrary colors ranging from 16 to 256 in the color
     /// palette
-    #[serde(default, deserialize_with = "de_indexed")]
+    #[dynamic(default)]
     pub indexed: HashMap<u8, RgbaColor>,
     /// Configure the colors and styling of the tab bar
     pub tab_bar: Option<TabBarColors>,
@@ -124,7 +117,7 @@ pub struct Palette {
     /// The color to use for the cursor when a dead key or leader state is active
     pub compose_cursor: Option<RgbaColor>,
 }
-impl_lua_conversion!(Palette);
+impl_lua_conversion_dynamic!(Palette);
 
 impl From<Palette> for wezterm_term::color::ColorPalette {
     fn from(cfg: Palette) -> wezterm_term::color::ColorPalette {
@@ -157,6 +150,14 @@ impl From<Palette> for wezterm_term::color::ColorPalette {
             }
         }
         for (&idx, &col) in &cfg.indexed {
+            if idx < 16 {
+                log::warn!(
+                    "Ignoring invalid colors.indexed index {}; \
+                           use `ansi` or `brights` to specify lower indices",
+                    idx
+                );
+                continue;
+            }
             p.colors.0[idx as usize] = col.into();
         }
         p
@@ -164,26 +165,25 @@ impl From<Palette> for wezterm_term::color::ColorPalette {
 }
 
 /// Specify the text styling for a tab in the tab bar
-#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[derive(Debug, Clone, Default, FromDynamic, ToDynamic)]
 pub struct TabBarColor {
     /// Specifies the intensity attribute for the tab title text
-    #[serde(default)]
+    #[dynamic(default)]
     pub intensity: wezterm_term::Intensity,
     /// Specifies the underline attribute for the tab title text
-    #[serde(default)]
+    #[dynamic(default)]
     pub underline: wezterm_term::Underline,
     /// Specifies the italic attribute for the tab title text
-    #[serde(default)]
+    #[dynamic(default)]
     pub italic: bool,
     /// Specifies the strikethrough attribute for the tab title text
-    #[serde(default)]
+    #[dynamic(default)]
     pub strikethrough: bool,
     /// The background color for the tab
     pub bg_color: RgbColor,
     /// The forgeground/text color for the tab
     pub fg_color: RgbColor,
 }
-impl_lua_conversion!(TabBarColor);
 
 impl TabBarColor {
     pub fn as_cell_attributes(&self) -> CellAttributes {
@@ -201,39 +201,38 @@ impl TabBarColor {
 /// Specifies the colors to use for the tab bar portion of the UI.
 /// These are not part of the terminal model and cannot be updated
 /// in the same way that the dynamic color schemes are.
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct TabBarColors {
     /// The background color for the tab bar
-    #[serde(default = "default_background")]
+    #[dynamic(default = "default_background")]
     pub background: RgbColor,
 
     /// Styling for the active tab
-    #[serde(default = "default_active_tab")]
+    #[dynamic(default = "default_active_tab")]
     pub active_tab: TabBarColor,
 
     /// Styling for other inactive tabs
-    #[serde(default = "default_inactive_tab")]
+    #[dynamic(default = "default_inactive_tab")]
     pub inactive_tab: TabBarColor,
 
     /// Styling for an inactive tab with a mouse hovering
-    #[serde(default = "default_inactive_tab_hover")]
+    #[dynamic(default = "default_inactive_tab_hover")]
     pub inactive_tab_hover: TabBarColor,
 
     /// Styling for the new tab button
-    #[serde(default = "default_inactive_tab")]
+    #[dynamic(default = "default_inactive_tab")]
     pub new_tab: TabBarColor,
 
     /// Styling for the new tab button with a mouse hovering
-    #[serde(default = "default_inactive_tab_hover")]
+    #[dynamic(default = "default_inactive_tab_hover")]
     pub new_tab_hover: TabBarColor,
 
-    #[serde(default = "default_inactive_tab_edge")]
+    #[dynamic(default = "default_inactive_tab_edge")]
     pub inactive_tab_edge: RgbaColor,
 
-    #[serde(default = "default_inactive_tab_edge_hover")]
+    #[dynamic(default = "default_inactive_tab_edge_hover")]
     pub inactive_tab_edge_hover: RgbaColor,
 }
-impl_lua_conversion!(TabBarColors);
 
 fn default_background() -> RgbColor {
     RgbColor::new_8bpc(0x33, 0x33, 0x33)
@@ -285,11 +284,11 @@ impl Default for TabBarColors {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct TabBarStyle {
-    #[serde(default = "default_new_tab")]
+    #[dynamic(default = "default_new_tab")]
     pub new_tab: String,
-    #[serde(default = "default_new_tab")]
+    #[dynamic(default = "default_new_tab")]
     pub new_tab_hover: String,
 }
 
@@ -303,35 +302,35 @@ impl Default for TabBarStyle {
 }
 
 fn default_new_tab() -> String {
-    format_as_escapes(vec![FormatItem::Text(" + ".to_string())]).unwrap()
+    " + ".to_string()
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct WindowFrameConfig {
-    #[serde(default = "default_inactive_titlebar_bg")]
+    #[dynamic(default = "default_inactive_titlebar_bg")]
     pub inactive_titlebar_bg: RgbColor,
-    #[serde(default = "default_active_titlebar_bg")]
+    #[dynamic(default = "default_active_titlebar_bg")]
     pub active_titlebar_bg: RgbColor,
-    #[serde(default = "default_inactive_titlebar_fg")]
+    #[dynamic(default = "default_inactive_titlebar_fg")]
     pub inactive_titlebar_fg: RgbColor,
-    #[serde(default = "default_active_titlebar_fg")]
+    #[dynamic(default = "default_active_titlebar_fg")]
     pub active_titlebar_fg: RgbColor,
-    #[serde(default = "default_inactive_titlebar_border_bottom")]
+    #[dynamic(default = "default_inactive_titlebar_border_bottom")]
     pub inactive_titlebar_border_bottom: RgbColor,
-    #[serde(default = "default_active_titlebar_border_bottom")]
+    #[dynamic(default = "default_active_titlebar_border_bottom")]
     pub active_titlebar_border_bottom: RgbColor,
-    #[serde(default = "default_button_fg")]
+    #[dynamic(default = "default_button_fg")]
     pub button_fg: RgbColor,
-    #[serde(default = "default_button_bg")]
+    #[dynamic(default = "default_button_bg")]
     pub button_bg: RgbColor,
-    #[serde(default = "default_button_hover_fg")]
+    #[dynamic(default = "default_button_hover_fg")]
     pub button_hover_fg: RgbColor,
-    #[serde(default = "default_button_hover_bg")]
+    #[dynamic(default = "default_button_hover_bg")]
     pub button_hover_bg: RgbColor,
 
-    #[serde(default)]
+    #[dynamic(default)]
     pub font: Option<TextStyle>,
-    #[serde(default)]
+    #[dynamic(default)]
     pub font_size: Option<f64>,
 }
 
@@ -394,9 +393,53 @@ fn default_button_bg() -> RgbColor {
     RgbColor::new_8bpc(0x33, 0x33, 0x33)
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Clone, FromDynamic, ToDynamic)]
 pub struct ColorSchemeFile {
     /// The color palette
     pub colors: Palette,
 }
-impl_lua_conversion!(ColorSchemeFile);
+
+impl ColorSchemeFile {
+    pub fn from_toml_value(value: &toml::Value) -> anyhow::Result<Self> {
+        Self::from_dynamic(&crate::toml_to_dynamic(value), Default::default())
+            .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    pub fn from_toml_str(s: &str) -> anyhow::Result<Self> {
+        let scheme: toml::Value = toml::from_str(s)?;
+        ColorSchemeFile::from_toml_value(&scheme)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_indexed_colors() {
+    let scheme = r##"
+[colors]
+foreground = "#005661"
+background = "#fef8ec"
+cursor_bg = "#005661"
+cursor_border = "#005661"
+cursor_fg = "#ffffff"
+selection_bg = "#cfe7f0"
+selection_fg = "#005661"
+
+ansi = [ "#8ca6a6" ,"#e64100" ,"#00b368" ,"#fa8900" ,"#0095a8" ,"#ff5792" ,"#00bdd6" ,"#005661" ]
+brights = [ "#8ca6a6" ,"#e5164a" ,"#00b368" ,"#b3694d" ,"#0094f0" ,"#ff5792" ,"#00bdd6" ,"#004d57" ]
+
+[colors.indexed]
+52 = "#fbdada" # minus
+88 = "#f6b6b6" # minus emph
+22 = "#d6ffd6" # plus
+28 = "#adffad" # plus emph
+53 = "#feecf7" # purple
+17 = "#e5dff6" # blue
+23 = "#d8fdf6" # cyan
+58 = "#f4ffe0" # yellow
+"##;
+    let scheme = ColorSchemeFile::from_toml_str(scheme).unwrap();
+    assert_eq!(
+        scheme.colors.indexed.get(&52),
+        Some(&RgbColor::new_8bpc(0xfb, 0xda, 0xda).into())
+    );
+}

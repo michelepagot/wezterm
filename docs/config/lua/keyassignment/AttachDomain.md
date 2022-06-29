@@ -1,6 +1,6 @@
 # AttachDomain(domain_name)
 
-*Since: nightly builds only*
+*Since: 20220624-141144-bd1b7c5d*
 
 Attempts to attach the named multiplexing domain.  The name can be any of the
 names used in you `ssh_domains`, `unix_domains` or `tls_clients`
@@ -29,7 +29,7 @@ return {
     }
   },
   keys = {
-    {key="U", mods="CTRL|SHIFT", action=wezterm.action{AttachDomain="devhost"}},
+    {key="U", mods="CTRL|SHIFT", action=wezterm.action.AttachDomain("devhost")},
   },
 }
 ```

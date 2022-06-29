@@ -6,17 +6,18 @@ use codec::{ListPanesResponse, SpawnV2, SplitPane};
 use config::keyassignment::SpawnTabDomain;
 use config::{SshDomain, TlsDomainClient, UnixDomain};
 use mux::connui::{ConnectionUI, ConnectionUIParams};
-use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState};
+use mux::domain::{alloc_domain_id, Domain, DomainId, DomainState, SplitSource};
 use mux::pane::{Pane, PaneId};
-use mux::tab::{SplitDirection, Tab, TabId};
+use mux::tab::{SplitRequest, Tab, TabId};
 use mux::window::WindowId;
 use mux::{Mux, MuxNotification};
-use portable_pty::{CommandBuilder, PtySize};
+use portable_pty::CommandBuilder;
 use promise::spawn::spawn_into_new_thread;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use wezterm_term::TerminalSize;
 
 pub struct ClientInner {
     pub client: Client,
@@ -401,17 +402,41 @@ impl ClientDomain {
                     let mut window = mux
                         .get_window_mut(local_window_id)
                         .expect("no such window!?");
+                    log::debug!("adding tab to existing local window {}", local_window_id);
                     if window.idx_by_id(tab.tab_id()).is_none() {
                         window.push(&tab);
                     }
-                } else if let Some(local_window_id) = primary_window_id.take() {
-                    inner.record_remote_to_local_window_mapping(remote_window_id, local_window_id);
-                    mux.add_tab_to_window(&tab, local_window_id)?;
-                } else {
-                    let local_window_id = mux.new_empty_window(workspace.take());
-                    inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
-                    mux.add_tab_to_window(&tab, *local_window_id)?;
+                    continue;
                 }
+
+                if let Some(local_window_id) = primary_window_id {
+                    // Verify that the workspace is consistent between the local and remote
+                    // windows
+                    if Some(
+                        mux.get_window(local_window_id)
+                            .expect("primary window to be valid")
+                            .get_workspace(),
+                    ) == workspace.as_deref()
+                    {
+                        // Yes! We can use this window
+                        log::debug!("adding {} as tab to {}", remote_window_id, local_window_id);
+                        inner.record_remote_to_local_window_mapping(
+                            remote_window_id,
+                            local_window_id,
+                        );
+                        mux.add_tab_to_window(&tab, local_window_id)?;
+                        primary_window_id.take();
+                        continue;
+                    }
+                }
+                log::debug!(
+                    "making new local window for remote {} in workspace {:?}",
+                    remote_window_id,
+                    workspace
+                );
+                let local_window_id = mux.new_empty_window(workspace.take());
+                inner.record_remote_to_local_window_mapping(remote_window_id, *local_window_id);
+                mux.add_tab_to_window(&tab, *local_window_id)?;
             }
         }
 
@@ -458,7 +483,7 @@ impl Domain for ClientDomain {
 
     async fn spawn_pane(
         &self,
-        _size: PtySize,
+        _size: TerminalSize,
         _command: Option<CommandBuilder>,
         _command_dir: Option<String>,
     ) -> anyhow::Result<Rc<dyn Pane>> {
@@ -467,7 +492,7 @@ impl Domain for ClientDomain {
 
     async fn spawn(
         &self,
-        size: PtySize,
+        size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
         window: WindowId,
@@ -513,11 +538,10 @@ impl Domain for ClientDomain {
 
     async fn split_pane(
         &self,
-        command: Option<CommandBuilder>,
-        command_dir: Option<String>,
+        source: SplitSource,
         tab_id: TabId,
         pane_id: PaneId,
-        direction: SplitDirection,
+        split_request: SplitRequest,
     ) -> anyhow::Result<Rc<dyn Pane>> {
         let inner = self
             .inner()
@@ -535,14 +559,23 @@ impl Domain for ClientDomain {
             .downcast_ref::<ClientPane>()
             .ok_or_else(|| anyhow!("pane_id {} is not a ClientPane", pane_id))?;
 
+        let (command, command_dir, move_pane_id) = match source {
+            SplitSource::Spawn {
+                command,
+                command_dir,
+            } => (command, command_dir, None),
+            SplitSource::MovePane(move_pane_id) => (None, None, Some(move_pane_id)),
+        };
+
         let result = inner
             .client
             .split_pane(SplitPane {
                 domain: SpawnTabDomain::CurrentPaneDomain,
                 pane_id: pane.remote_pane_id,
-                direction,
+                split_request,
                 command,
                 command_dir,
+                move_pane_id,
             })
             .await?;
 
@@ -563,7 +596,7 @@ impl Domain for ClientDomain {
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
-        tab.split_and_insert(pane_index, direction, Rc::clone(&pane))
+        tab.split_and_insert(pane_index, split_request, Rc::clone(&pane))
             .ok();
 
         mux.add_pane(&pane)?;

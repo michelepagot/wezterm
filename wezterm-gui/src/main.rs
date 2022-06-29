@@ -3,6 +3,7 @@
 
 use ::window::*;
 use anyhow::{anyhow, Context};
+use clap::{Parser, ValueHint};
 use config::{ConfigHandle, SshDomain, SshMultiplexing};
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
@@ -15,7 +16,6 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use structopt::StructOpt;
 use termwiz::cell::{CellAttributes, UnicodeVersion};
 use termwiz::surface::{Line, SEQ_ZERO};
 use wezterm_bidi::Direction;
@@ -49,28 +49,28 @@ mod utilsprites;
 pub use selection::SelectionMode;
 pub use termwindow::{set_window_class, set_window_position, TermWindow, ICON_DATA};
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     about = "Wez's Terminal Emulator\nhttp://github.com/wez/wezterm",
-    global_setting = structopt::clap::AppSettings::ColoredHelp,
     version = config::wezterm_version()
 )]
 struct Opt {
     /// Skip loading wezterm.lua
-    #[structopt(name = "skip-config", short = "n")]
+    #[clap(name = "skip-config", short = 'n')]
     skip_config: bool,
 
     /// Specify the configuration file to use, overrides the normal
     /// configuration file resolution
-    #[structopt(
+    #[clap(
         long = "config-file",
         parse(from_os_str),
-        conflicts_with = "skip-config"
+        conflicts_with = "skip-config",
+        value_hint=ValueHint::FilePath,
     )]
     config_file: Option<OsString>,
 
     /// Override specific configuration values
-    #[structopt(
+    #[clap(
         long = "config",
         name = "name=value",
         parse(try_from_str = name_equals_value),
@@ -79,33 +79,36 @@ struct Opt {
 
     /// On Windows, whether to attempt to attach to the parent
     /// process console to display logging output
-    #[structopt(long = "attach-parent-console")]
+    #[clap(long = "attach-parent-console")]
     #[allow(dead_code)]
     attach_parent_console: bool,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     cmd: Option<SubCommand>,
 }
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 enum SubCommand {
-    #[structopt(
+    #[clap(
         name = "start",
         about = "Start the GUI, optionally running an alternative program"
     )]
     Start(StartCommand),
 
-    #[structopt(name = "ssh", about = "Establish an ssh session")]
+    #[clap(name = "ssh", about = "Establish an ssh session")]
     Ssh(SshCommand),
 
-    #[structopt(name = "serial", about = "Open a serial port")]
+    #[clap(name = "serial", about = "Open a serial port")]
     Serial(SerialCommand),
 
-    #[structopt(name = "connect", about = "Connect to wezterm multiplexer")]
+    #[clap(name = "connect", about = "Connect to wezterm multiplexer")]
     Connect(ConnectCommand),
 
-    #[structopt(name = "ls-fonts", about = "Display information about fonts")]
+    #[clap(name = "ls-fonts", about = "Display information about fonts")]
     LsFonts(LsFontsCommand),
+
+    #[clap(name = "show-keys", about = "Show key assignments")]
+    ShowKeys(ShowKeysCommand),
 }
 
 async fn async_run_ssh(opts: SshCommand) -> anyhow::Result<()> {
@@ -179,12 +182,13 @@ fn run_serial(config: config::ConfigHandle, opts: &SerialCommand) -> anyhow::Res
     let mux = setup_mux(domain.clone(), &config, Some("local"), None)?;
 
     let gui = crate::frontend::try_new()?;
+    let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as u32;
     {
         let window_id = mux.new_empty_window(None);
         block_on(domain.attach(Some(*window_id)))?; // FIXME: blocking
 
         // FIXME: blocking
-        let _tab = block_on(domain.spawn(config.initial_size(), None, None, *window_id))?;
+        let _tab = block_on(domain.spawn(config.initial_size(dpi), None, None, *window_id))?;
     }
 
     maybe_show_configuration_error_window();
@@ -224,7 +228,8 @@ async fn async_run_with_domain_as_default(
     mux.add_domain(&domain);
     mux.set_default_domain(&domain);
 
-    spawn_tab_in_default_domain_if_mux_is_empty(cmd).await
+    let is_connecting = true;
+    spawn_tab_in_default_domain_if_mux_is_empty(cmd, is_connecting).await
 }
 
 async fn async_run_mux_client(opts: ConnectCommand) -> anyhow::Result<()> {
@@ -273,13 +278,31 @@ fn run_mux_client(opts: ConnectCommand) -> anyhow::Result<()> {
 
 async fn spawn_tab_in_default_domain_if_mux_is_empty(
     cmd: Option<CommandBuilder>,
+    is_connecting: bool,
 ) -> anyhow::Result<()> {
     let mux = Mux::get().unwrap();
 
     let domain = mux.default_domain();
-    let window_id = mux.new_empty_window(None);
 
-    domain.attach(Some(*window_id)).await?;
+    if !is_connecting {
+        let have_panes_in_domain = mux
+            .iter_panes()
+            .iter()
+            .any(|p| p.domain_id() == domain.domain_id());
+
+        if have_panes_in_domain {
+            return Ok(());
+        }
+    }
+
+    let window_id = {
+        // Force the builder to notify the frontend early,
+        // so that the attach await below doesn't block it
+        let builder = mux.new_empty_window(None);
+        *builder
+    };
+
+    domain.attach(Some(window_id)).await?;
 
     let have_panes_in_domain = mux
         .iter_panes()
@@ -302,8 +325,9 @@ async fn spawn_tab_in_default_domain_if_mux_is_empty(
         true
     });
 
+    let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi()) as u32;
     let _tab = domain
-        .spawn(config.initial_size(), cmd, None, *window_id)
+        .spawn(config.initial_size(dpi), cmd, None, window_id)
         .await?;
     Ok(())
 }
@@ -380,7 +404,25 @@ async fn async_run_terminal_gui(
     if !opts.no_auto_connect {
         connect_to_auto_connect_domains().await?;
     }
-    spawn_tab_in_default_domain_if_mux_is_empty(cmd).await
+
+    async fn trigger_gui_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
+        if let Some(lua) = lua {
+            let args = lua.pack_multi(())?;
+            config::lua::emit_event(&lua, ("gui-startup".to_string(), args)).await?;
+        }
+        Ok(())
+    }
+
+    if let Err(err) =
+        config::with_lua_config_on_main_thread(move |lua| trigger_gui_startup(lua)).await
+    {
+        let message = format!("while processing gui-startup event: {:#}", err);
+        log::error!("{}", message);
+        persistent_toast_notification("Error", &message);
+    }
+
+    let is_connecting = false;
+    spawn_tab_in_default_domain_if_mux_is_empty(cmd, is_connecting).await
 }
 
 #[derive(Debug)]
@@ -463,7 +505,7 @@ impl Publish {
                                 window_id: None,
                                 command,
                                 command_dir: None,
-                                size: config.initial_size(),
+                                size: config.initial_size(0),
                                 workspace: workspace.unwrap_or(
                                     config
                                         .default_workspace
@@ -676,6 +718,12 @@ fn maybe_show_configuration_error_window() {
         let err = format!("{:#}", err);
         mux::connui::show_configuration_error_message(&err);
     }
+}
+
+fn run_show_keys(config: config::ConfigHandle, _cmd: &ShowKeysCommand) -> anyhow::Result<()> {
+    let map = crate::inputmap::InputMap::new(&config);
+    map.show_keys();
+    Ok(())
 }
 
 pub fn run_ls_fonts(config: config::ConfigHandle, cmd: &LsFontsCommand) -> anyhow::Result<()> {
@@ -913,7 +961,7 @@ fn run() -> anyhow::Result<()> {
         }
     }
 
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
 
     // This is a bit gross.
     // In order to not to automatically open a standard windows console when
@@ -942,7 +990,7 @@ fn run() -> anyhow::Result<()> {
         opts.config_file.as_ref(),
         &opts.config_override,
         opts.skip_config,
-    );
+    )?;
     let config = config::configuration();
 
     let sub = match opts.cmd.as_ref().cloned() {
@@ -953,7 +1001,7 @@ fn run() -> anyhow::Result<()> {
             for a in &config.default_gui_startup_args {
                 argv.push(a.clone());
             }
-            SubCommand::from_iter_safe(&argv).with_context(|| {
+            SubCommand::try_parse_from(&argv).with_context(|| {
                 format!(
                     "parsing the default_gui_startup_args config: {:?}",
                     config.default_gui_startup_args
@@ -971,5 +1019,6 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Serial(serial) => run_serial(config, &serial),
         SubCommand::Connect(connect) => run_mux_client(connect),
         SubCommand::LsFonts(cmd) => run_ls_fonts(config, &cmd),
+        SubCommand::ShowKeys(cmd) => run_show_keys(config, &cmd),
     }
 }

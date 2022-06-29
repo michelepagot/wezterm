@@ -13,6 +13,7 @@ use rangeset::RangeSet;
 use smol::channel::{bounded, Receiver, TryRecvError};
 use std::cell::{RefCell, RefMut};
 use std::collections::{HashMap, HashSet};
+use std::convert::TryInto;
 use std::io::Result as IoResult;
 use std::ops::Range;
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use url::Url;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::{
     Alert, AlertHandler, CellAttributes, Clipboard, DownloadHandler, KeyCode, KeyModifiers,
-    MouseEvent, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration,
+    MouseEvent, SemanticZone, StableRowIndex, Terminal, TerminalConfiguration, TerminalSize,
 };
 
 #[derive(Debug)]
@@ -275,14 +276,14 @@ impl Pane for LocalPane {
         self.terminal.borrow_mut().key_up(key, mods)
     }
 
-    fn resize(&self, size: PtySize) -> Result<(), Error> {
-        self.pty.borrow_mut().resize(size)?;
-        self.terminal.borrow_mut().resize(
-            size.rows as usize,
-            size.cols as usize,
-            size.pixel_width as usize,
-            size.pixel_height as usize,
-        );
+    fn resize(&self, size: TerminalSize) -> Result<(), Error> {
+        self.pty.borrow_mut().resize(PtySize {
+            rows: size.rows.try_into()?,
+            cols: size.cols.try_into()?,
+            pixel_width: size.pixel_width.try_into()?,
+            pixel_height: size.pixel_height.try_into()?,
+        })?;
+        self.terminal.borrow_mut().resize(size);
         Ok(())
     }
 
@@ -538,6 +539,7 @@ impl Pane for LocalPane {
                 Pattern::Regex(r) => {
                     if let Ok(re) = regex::Regex::new(r) {
                         // Allow for the regex to contain captures
+                        log::trace!("regex search for {:?} in `{:?}`", r, haystack);
                         for c in re.captures_iter(haystack) {
                             // Look for the captures in reverse order, as index==0 is
                             // the whole matched string.  We can't just call
@@ -545,6 +547,9 @@ impl Pane for LocalPane {
                             for idx in (0..c.len()).rev() {
                                 if let Some(m) = c.get(idx) {
                                     let s = m.as_str();
+                                    if s.is_empty() {
+                                        continue;
+                                    }
                                     let match_id = match uniq_matches.get(s).copied() {
                                         Some(id) => id,
                                         None => {
@@ -577,6 +582,8 @@ impl Pane for LocalPane {
             let stable_row = screen.phys_to_stable_row_index(idx);
 
             let mut wrapped = false;
+            let mut trailing_spaces = None;
+
             for (grapheme_idx, cell) in line.visible_cells() {
                 coords.push(Coord {
                     byte_idx: haystack.len(),
@@ -585,6 +592,15 @@ impl Pane for LocalPane {
                 });
 
                 let s = cell.str();
+                if s == " " {
+                    // Keep track of runs of trailing spaces; we'll prune
+                    // them out so that `$` in a regex works as expected.
+                    if trailing_spaces.is_none() {
+                        trailing_spaces.replace(haystack.len());
+                    }
+                } else {
+                    trailing_spaces.take();
+                }
                 if let Pattern::CaseInSensitiveString(_) = &pattern {
                     // normalize the case so we match everything lowercase
                     haystack.push_str(&s.to_lowercase());
@@ -592,6 +608,18 @@ impl Pane for LocalPane {
                     haystack.push_str(cell.str());
                 }
                 wrapped = cell.attrs().wrapped();
+            }
+
+            if let Some(trailing_spaces) = trailing_spaces {
+                // Remove trailing spaces from the haystack
+                haystack.truncate(trailing_spaces);
+                while coords
+                    .last()
+                    .map(|c| c.byte_idx >= trailing_spaces)
+                    .unwrap_or(false)
+                {
+                    coords.pop();
+                }
             }
 
             if !wrapped {
@@ -707,6 +735,24 @@ struct LocalPaneNotifHandler {
 impl AlertHandler for LocalPaneNotifHandler {
     fn alert(&mut self, alert: Alert) {
         if let Some(mux) = Mux::get() {
+            match &alert {
+                Alert::WindowTitleChanged(title) => {
+                    if let Some((_domain, window_id, _tab_id)) = mux.resolve_pane_id(self.pane_id) {
+                        if let Some(mut window) = mux.get_window_mut(window_id) {
+                            window.set_title(title);
+                        }
+                    }
+                }
+                Alert::TabTitleChanged(title) => {
+                    if let Some((_domain, _window_id, tab_id)) = mux.resolve_pane_id(self.pane_id) {
+                        if let Some(tab) = mux.get_tab(tab_id) {
+                            tab.set_title(title.as_deref().unwrap_or(""));
+                        }
+                    }
+                }
+                _ => {}
+            }
+
             mux.notify(MuxNotification::Alert {
                 pane_id: self.pane_id,
                 alert,
@@ -791,7 +837,10 @@ impl LocalPane {
 
         #[cfg(windows)]
         if let Some(fg) = self.divine_foreground_process() {
-            return Url::parse(&format!("file://localhost{}", fg.cwd.display())).ok();
+            // Since windows paths typically start with something like C:\,
+            // we cannot simply stick `localhost` on the front; we have to
+            // omit the hostname otherwise the url parser is unhappy.
+            return Url::parse(&format!("file://{}", fg.cwd.display())).ok();
         }
 
         #[allow(unreachable_code)]

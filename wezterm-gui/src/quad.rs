@@ -20,6 +20,7 @@ pub struct Vertex {
     // glyph texture
     pub tex: (f32, f32),
     pub fg_color: (f32, f32, f32, f32),
+    pub alt_color: (f32, f32, f32, f32),
     pub hsv: (f32, f32, f32),
     // We use a float for this because I can't get
     // bool or integer values to work:
@@ -34,8 +35,11 @@ pub struct Vertex {
     // 3.0 -> like 2.0, except that instead of an
     //        image, we use the solid bg color
     pub has_color: f32,
+    pub mix_value: f32,
 }
-::window::glium::implement_vertex!(Vertex, position, tex, fg_color, hsv, has_color);
+::window::glium::implement_vertex!(
+    Vertex, position, tex, fg_color, alt_color, hsv, has_color, mix_value
+);
 
 /// A helper for updating the 4 vertices that compose a glyph cell
 pub struct Quad<'a> {
@@ -45,10 +49,18 @@ pub struct Quad<'a> {
 impl<'a> Quad<'a> {
     /// Assign the texture coordinates
     pub fn set_texture(&mut self, coords: TextureRect) {
-        self.vert[V_TOP_LEFT].tex = (coords.min_x(), coords.min_y());
-        self.vert[V_TOP_RIGHT].tex = (coords.max_x(), coords.min_y());
-        self.vert[V_BOT_LEFT].tex = (coords.min_x(), coords.max_y());
-        self.vert[V_BOT_RIGHT].tex = (coords.max_x(), coords.max_y());
+        let x1 = coords.min_x();
+        let x2 = coords.max_x();
+        let y1 = coords.min_y();
+        let y2 = coords.max_y();
+        self.set_texture_discrete(x1, x2, y1, y2);
+    }
+
+    pub fn set_texture_discrete(&mut self, x1: f32, x2: f32, y1: f32, y2: f32) {
+        self.vert[V_TOP_LEFT].tex = (x1, y1);
+        self.vert[V_TOP_RIGHT].tex = (x2, y1);
+        self.vert[V_BOT_LEFT].tex = (x1, y2);
+        self.vert[V_BOT_RIGHT].tex = (x2, y2);
     }
 
     /// Set the color glyph "flag"
@@ -56,6 +68,14 @@ impl<'a> Quad<'a> {
         let has_color = if has_color { 1. } else { 0. };
         for v in self.vert.iter_mut() {
             v.has_color = has_color;
+        }
+    }
+
+    /// Mark as a grayscale polyquad; color and alpha will be
+    /// multipled with those in the texture
+    pub fn set_grayscale(&mut self) {
+        for v in self.vert.iter_mut() {
+            v.has_color = 4.0;
         }
     }
 
@@ -76,6 +96,15 @@ impl<'a> Quad<'a> {
     pub fn set_fg_color(&mut self, color: LinearRgba) {
         for v in self.vert.iter_mut() {
             v.fg_color = color.tuple();
+        }
+        self.set_alt_color_and_mix_value(color, 0.);
+    }
+
+    /// Must be called after set_fg_color
+    pub fn set_alt_color_and_mix_value(&mut self, color: LinearRgba, mix_value: f32) {
+        for v in self.vert.iter_mut() {
+            v.alt_color = color.tuple();
+            v.mix_value = mix_value;
         }
     }
 

@@ -8,7 +8,7 @@ use luahelper::*;
 use mlua::{UserData, UserDataMethods};
 use mux::window::WindowId as MuxWindowId;
 use mux::Mux;
-use serde::*;
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_toast_notification::ToastNotification;
 use window::{Connection, ConnectionOps, DeadKeyStatus, WindowOps, WindowState};
 
@@ -32,6 +32,9 @@ impl GuiWin {
 impl UserData for GuiWin {
     fn add_methods<'lua, M: UserDataMethods<'lua, Self>>(methods: &mut M) {
         methods.add_method("window_id", |_, this, _: ()| Ok(this.mux_window_id));
+        methods.add_method("mux_window", |_, this, _: ()| {
+            Ok(mux_lua::MuxWindow(this.mux_window_id))
+        });
         methods.add_method(
             "toast_notification",
             |_, _, (title, message, url, timeout): (String, String, Option<String>, Option<u64>)| {
@@ -60,14 +63,14 @@ impl UserData for GuiWin {
                 .map_err(|e| anyhow::anyhow!("{:#}", e))
                 .map_err(luaerr)?;
 
-            #[derive(Serialize, Deserialize)]
+            #[derive(FromDynamic, ToDynamic)]
             struct Dims {
                 pixel_width: usize,
                 pixel_height: usize,
                 dpi: usize,
                 is_full_screen: bool,
             }
-            impl_lua_conversion!(Dims);
+            impl_lua_conversion_dynamic!(Dims);
 
             let dims = Dims {
                 pixel_width: dims.pixel_width,
@@ -116,7 +119,7 @@ impl UserData for GuiWin {
 
             Ok((*config).clone())
         });
-        methods.add_async_method("get_config_overrides", |_, this, _: ()| async move {
+        methods.add_async_method("get_config_overrides", |lua, this, _: ()| async move {
             let (tx, rx) = smol::channel::bounded(1);
             this.window.notify(TermWindowNotif::GetConfigOverrides(tx));
             let overrides = rx
@@ -125,12 +128,12 @@ impl UserData for GuiWin {
                 .map_err(|e| anyhow::anyhow!("{:#}", e))
                 .map_err(luaerr)?;
 
-            let wrap = JsonLua(overrides);
-            Ok(wrap)
+            dynamic_to_lua_value(lua, overrides)
         });
-        methods.add_method("set_config_overrides", |_, this, value: JsonLua| {
+        methods.add_method("set_config_overrides", |_, this, value: mlua::Value| {
+            let value = lua_value_to_dynamic(value)?;
             this.window
-                .notify(TermWindowNotif::SetConfigOverrides(value.0));
+                .notify(TermWindowNotif::SetConfigOverrides(value));
             Ok(())
         });
         methods.add_async_method("leader_is_active", |_, this, _: ()| async move {

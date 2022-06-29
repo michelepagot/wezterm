@@ -189,6 +189,14 @@ impl<L, N> Tree<L, N> {
             path: Box::new(Path::Top),
         }
     }
+
+    pub fn num_leaves(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Leaf(_) => 1,
+            Self::Node { left, right, .. } => left.num_leaves() + right.num_leaves(),
+        }
+    }
 }
 
 impl<L, N> Cursor<L, N> {
@@ -310,6 +318,34 @@ impl<L, N> Cursor<L, N> {
             (Tree::Leaf(_), Path::Top) => unreachable!(),
             (Tree::Empty, _) => unreachable!(),
             (Tree::Node { .. }, _) => unreachable!(),
+        }
+    }
+
+    pub fn split_node_and_insert_left(self, to_insert: L) -> Result<Self, Self> {
+        match *self.it {
+            Tree::Node { left, right, data } => Ok(Self {
+                it: Box::new(Tree::Node {
+                    data: None,
+                    right: Box::new(Tree::Node { left, right, data }),
+                    left: Box::new(Tree::Leaf(to_insert)),
+                }),
+                path: self.path,
+            }),
+            _ => Err(self),
+        }
+    }
+
+    pub fn split_node_and_insert_right(self, to_insert: L) -> Result<Self, Self> {
+        match *self.it {
+            Tree::Node { left, right, data } => Ok(Self {
+                it: Box::new(Tree::Node {
+                    data: None,
+                    left: Box::new(Tree::Node { left, right, data }),
+                    right: Box::new(Tree::Leaf(to_insert)),
+                }),
+                path: self.path,
+            }),
+            _ => Err(self),
         }
     }
 
@@ -456,6 +492,40 @@ impl<L, N> Cursor<L, N> {
             }
         } else {
             self.go_left()
+        }
+    }
+
+    /// Move the current position to the next in a postorder traversal.
+    /// Returns the modified cursor position.
+    ///
+    /// In the case where there are no more nodes in the postorder traversal,
+    /// yields `Err` with the newly adjusted cursor; calling `postorder_next`
+    /// after it has yielded `Err` can potentially yield `Ok` with previously
+    /// visited nodes, so the caller must take care to stop iterating when
+    /// `Err` is received!
+    pub fn postorder_next(mut self) -> Result<Self, Self> {
+        // Since we are a "proper" binary tree, we know we cannot have
+        // difficult cases such as a left without a right or vice versa.
+
+        if self.is_leaf() {
+            if self.is_right() {
+                return self.go_up()?.go_left();
+            }
+
+            // while (We were on the left)
+            loop {
+                self = self.go_up()?;
+
+                if self.is_top() {
+                    return Err(self);
+                }
+
+                if self.is_right() {
+                    return self.go_up()?.go_left();
+                }
+            }
+        } else {
+            self.go_right()
         }
     }
 

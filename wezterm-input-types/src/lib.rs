@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 pub struct PixelUnit;
 pub struct ScreenPixelUnit;
@@ -14,7 +15,19 @@ pub type ScreenPoint = euclid::Point2D<isize, ScreenPixelUnit>;
 /// Which key is pressed.  Not all of these are probable to appear
 /// on most systems.  A lot of this list is @wez trawling docs and
 /// making an entry for things that might be possible in this first pass.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, Ord, PartialOrd)]
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Deserialize,
+    Serialize,
+    Ord,
+    PartialOrd,
+    FromDynamic,
+    ToDynamic,
+)]
 pub enum KeyCode {
     /// The decoded unicode character
     Char(char),
@@ -438,8 +451,9 @@ impl ToString for KeyCode {
 }
 
 bitflags! {
-    #[derive(Default, Deserialize, Serialize)]
-    pub struct Modifiers: u8 {
+    #[derive(Default, Deserialize, Serialize, FromDynamic, ToDynamic)]
+    #[dynamic(into="String", try_from="String")]
+    pub struct Modifiers: u16 {
         const NONE = 0;
         const SHIFT = 1<<1;
         const ALT = 1<<2;
@@ -448,6 +462,47 @@ bitflags! {
         const LEFT_ALT = 1<<5;
         const RIGHT_ALT = 1<<6;
         const LEADER = 1<<7;
+        const LEFT_CTRL = 1<<8;
+        const RIGHT_CTRL = 1<<9;
+        const LEFT_SHIFT = 1<<10;
+        const RIGHT_SHIFT = 1<<11;
+        const ENHANCED_KEY = 1<<12;
+    }
+}
+
+impl TryFrom<String> for Modifiers {
+    type Error = String;
+
+    fn try_from(s: String) -> Result<Modifiers, String> {
+        let mut mods = Modifiers::NONE;
+        for ele in s.split('|') {
+            // Allow for whitespace; debug printing Modifiers includes spaces
+            // around the `|` so it is desirable to be able to reverse that
+            // encoding here.
+            let ele = ele.trim();
+            if ele == "SHIFT" {
+                mods |= Modifiers::SHIFT;
+            } else if ele == "ALT" || ele == "OPT" || ele == "META" {
+                mods |= Modifiers::ALT;
+            } else if ele == "CTRL" {
+                mods |= Modifiers::CTRL;
+            } else if ele == "SUPER" || ele == "CMD" || ele == "WIN" {
+                mods |= Modifiers::SUPER;
+            } else if ele == "LEADER" {
+                mods |= Modifiers::LEADER;
+            } else if ele == "NONE" || ele == "" {
+                mods |= Modifiers::NONE;
+            } else {
+                return Err(format!("invalid modifier name {} in {}", ele, s));
+            }
+        }
+        Ok(mods)
+    }
+}
+
+impl Into<String> for &Modifiers {
+    fn into(self) -> String {
+        self.to_string()
     }
 }
 
@@ -466,6 +521,11 @@ impl ToString for Modifiers {
             (Self::LEFT_ALT, "LEFT_ALT"),
             (Self::RIGHT_ALT, "RIGHT_ALT"),
             (Self::LEADER, "LEADER"),
+            (Self::LEFT_CTRL, "LEFT_CTRL"),
+            (Self::RIGHT_CTRL, "RIGHT_CTRL"),
+            (Self::LEFT_SHIFT, "LEFT_SHIFT"),
+            (Self::RIGHT_SHIFT, "RIGHT_SHIFT"),
+            (Self::ENHANCED_KEY, "ENHANCED_KEY"),
         ] {
             if !self.contains(value) {
                 continue;
@@ -480,9 +540,38 @@ impl ToString for Modifiers {
     }
 }
 
+impl Modifiers {
+    /// Remove positional and other "supplemental" bits that
+    /// are used to carry around implementation details, but that
+    /// are not bits that should be matched when matching key
+    /// assignments.
+    pub fn remove_positional_mods(self) -> Self {
+        self - (Self::LEFT_ALT
+            | Self::RIGHT_ALT
+            | Self::LEFT_CTRL
+            | Self::RIGHT_CTRL
+            | Self::LEFT_SHIFT
+            | Self::RIGHT_SHIFT
+            | Self::ENHANCED_KEY)
+    }
+}
+
 /// These keycodes identify keys based on their physical
 /// position on an ANSI-standard US keyboard.
-#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq, Hash, Copy, Ord, PartialOrd)]
+#[derive(
+    Debug,
+    Deserialize,
+    Serialize,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Copy,
+    Ord,
+    PartialOrd,
+    FromDynamic,
+    ToDynamic,
+)]
 pub enum PhysKeyCode {
     A,
     B,
@@ -1098,19 +1187,34 @@ impl KeyEvent {
         // defines the dwControlKeyState values
         let mut control_key_state = 0;
         const SHIFT_PRESSED: usize = 0x10;
-        // const RIGHT_ALT_PRESSED: usize = 0x01;
+        const ENHANCED_KEY: usize = 0x100;
+        const RIGHT_ALT_PRESSED: usize = 0x01;
         const LEFT_ALT_PRESSED: usize = 0x02;
         const LEFT_CTRL_PRESSED: usize = 0x08;
-        // const RIGHT_CTRL_PRESSED: usize = 0x04;
+        const RIGHT_CTRL_PRESSED: usize = 0x04;
 
         if self.modifiers.contains(Modifiers::SHIFT) {
             control_key_state |= SHIFT_PRESSED;
         }
-        if self.modifiers.contains(Modifiers::ALT) {
+
+        if self.modifiers.contains(Modifiers::RIGHT_ALT) {
+            control_key_state |= RIGHT_ALT_PRESSED;
+        } else if self.modifiers.contains(Modifiers::ALT) {
             control_key_state |= LEFT_ALT_PRESSED;
         }
-        if self.modifiers.contains(Modifiers::CTRL) {
+        if self.modifiers.contains(Modifiers::LEFT_ALT) {
+            control_key_state |= LEFT_ALT_PRESSED;
+        }
+        if self.modifiers.contains(Modifiers::RIGHT_CTRL) {
+            control_key_state |= RIGHT_CTRL_PRESSED;
+        } else if self.modifiers.contains(Modifiers::CTRL) {
             control_key_state |= LEFT_CTRL_PRESSED;
+        }
+        if self.modifiers.contains(Modifiers::LEFT_CTRL) {
+            control_key_state |= LEFT_CTRL_PRESSED;
+        }
+        if self.modifiers.contains(Modifiers::ENHANCED_KEY) {
+            control_key_state |= ENHANCED_KEY;
         }
 
         let key_down = if self.key_is_down { 1 } else { 0 };
@@ -1118,7 +1222,16 @@ impl KeyEvent {
         match &self.key {
             KeyCode::Composed(_) => None,
             KeyCode::Char(c) => {
-                let uni = *c as u32;
+                let c = if self.modifiers.contains(Modifiers::CTRL) {
+                    // Ensure that we rewrite the unicode value to the ASCII CTRL
+                    // equivalent value.
+                    // <https://github.com/microsoft/terminal/issues/13134>
+                    ctrl_mapping(*c).unwrap_or(*c)
+                } else {
+                    *c
+                };
+                let uni = c as u32;
+
                 Some(format!(
                     "\u{1b}[{};{};{};{};{};{}_",
                     vkey, scan_code, uni, key_down, control_key_state, self.repeat_count
@@ -1136,8 +1249,9 @@ impl KeyEvent {
 }
 
 bitflags! {
-    #[derive(Deserialize, Serialize)]
+    #[derive(Deserialize, Serialize, FromDynamic, ToDynamic)]
     #[serde(try_from = "String")]
+    #[dynamic(try_from = "String")]
     pub struct WindowDecorations: u8 {
         const TITLE = 1;
         const RESIZE = 2;
@@ -1169,4 +1283,54 @@ impl Default for WindowDecorations {
     fn default() -> Self {
         WindowDecorations::TITLE | WindowDecorations::RESIZE
     }
+}
+
+/// Map c to its Ctrl equivalent.
+/// In theory, this mapping is simply translating alpha characters
+/// to upper case and then masking them by 0x1f, but xterm inherits
+/// some built-in translation from legacy X11 so that are some
+/// aliased mappings and a couple that might be technically tied
+/// to US keyboard layout (particularly the punctuation characters
+/// produced in combination with SHIFT) that may not be 100%
+/// the right thing to do here for users with non-US layouts.
+#[cfg(windows)]
+fn ctrl_mapping(c: char) -> Option<char> {
+    // Please also sync with the copy of this function that
+    // lives in termwiz :-/
+    Some(match c {
+        '@' | '`' | ' ' | '2' => '\x00',
+        'A' | 'a' => '\x01',
+        'B' | 'b' => '\x02',
+        'C' | 'c' => '\x03',
+        'D' | 'd' => '\x04',
+        'E' | 'e' => '\x05',
+        'F' | 'f' => '\x06',
+        'G' | 'g' => '\x07',
+        'H' | 'h' => '\x08',
+        'I' | 'i' => '\x09',
+        'J' | 'j' => '\x0a',
+        'K' | 'k' => '\x0b',
+        'L' | 'l' => '\x0c',
+        'M' | 'm' => '\x0d',
+        'N' | 'n' => '\x0e',
+        'O' | 'o' => '\x0f',
+        'P' | 'p' => '\x10',
+        'Q' | 'q' => '\x11',
+        'R' | 'r' => '\x12',
+        'S' | 's' => '\x13',
+        'T' | 't' => '\x14',
+        'U' | 'u' => '\x15',
+        'V' | 'v' => '\x16',
+        'W' | 'w' => '\x17',
+        'X' | 'x' => '\x18',
+        'Y' | 'y' => '\x19',
+        'Z' | 'z' => '\x1a',
+        '[' | '3' | '{' => '\x1b',
+        '\\' | '4' | '|' => '\x1c',
+        ']' | '5' | '}' => '\x1d',
+        '^' | '6' | '~' => '\x1e',
+        '_' | '7' | '/' => '\x1f',
+        '8' | '?' => '\x7f', // `Delete`
+        _ => return None,
+    })
 }

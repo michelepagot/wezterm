@@ -7,16 +7,17 @@
 
 use crate::localpane::LocalPane;
 use crate::pane::{alloc_pane_id, Pane, PaneId};
-use crate::tab::{SplitDirection, Tab, TabId};
+use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::WindowId;
 use crate::Mux;
 use anyhow::{bail, Error};
 use async_trait::async_trait;
 use config::{configuration, WslDomain};
 use downcast_rs::{impl_downcast, Downcast};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize, PtySystem};
+use portable_pty::{native_pty_system, CommandBuilder, PtySystem};
 use std::ffi::OsString;
 use std::rc::Rc;
+use wezterm_term::TerminalSize;
 
 static DOMAIN_ID: ::std::sync::atomic::AtomicUsize = ::std::sync::atomic::AtomicUsize::new(0);
 pub type DomainId = usize;
@@ -31,12 +32,21 @@ pub fn alloc_domain_id() -> DomainId {
     DOMAIN_ID.fetch_add(1, ::std::sync::atomic::Ordering::Relaxed)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SplitSource {
+    Spawn {
+        command: Option<CommandBuilder>,
+        command_dir: Option<String>,
+    },
+    MovePane(PaneId),
+}
+
 #[async_trait(?Send)]
 pub trait Domain: Downcast {
     /// Spawn a new command within this domain
     async fn spawn(
         &self,
-        size: PtySize,
+        size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
         window: WindowId,
@@ -55,11 +65,10 @@ pub trait Domain: Downcast {
 
     async fn split_pane(
         &self,
-        command: Option<CommandBuilder>,
-        command_dir: Option<String>,
+        source: SplitSource,
         tab: TabId,
         pane_id: PaneId,
-        direction: SplitDirection,
+        split_request: SplitRequest,
     ) -> anyhow::Result<Rc<dyn Pane>> {
         let mux = Mux::get().unwrap();
         let tab = match mux.get_tab(tab) {
@@ -76,22 +85,47 @@ pub trait Domain: Downcast {
             None => anyhow::bail!("invalid pane id {}", pane_id),
         };
 
-        let split_size = match tab.compute_split_size(pane_index, direction) {
+        let split_size = match tab.compute_split_size(pane_index, split_request) {
             Some(s) => s,
             None => anyhow::bail!("invalid pane index {}", pane_index),
         };
 
-        let pane = self
-            .spawn_pane(split_size.second, command, command_dir)
-            .await?;
+        let pane = match source {
+            SplitSource::Spawn {
+                command,
+                command_dir,
+            } => {
+                self.spawn_pane(split_size.second, command, command_dir)
+                    .await?
+            }
+            SplitSource::MovePane(src_pane_id) => {
+                let (_domain, _window, src_tab) = mux
+                    .resolve_pane_id(src_pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("pane {} not found", src_pane_id))?;
+                let src_tab = match mux.get_tab(src_tab) {
+                    Some(t) => t,
+                    None => anyhow::bail!("Invalid tab id {}", src_tab),
+                };
 
-        tab.split_and_insert(pane_index, direction, Rc::clone(&pane))?;
+                let pane = src_tab.remove_pane(src_pane_id).ok_or_else(|| {
+                    anyhow::anyhow!("pane {} not found in its containing tab!?", src_pane_id)
+                })?;
+
+                if src_tab.is_dead() {
+                    mux.remove_tab(src_tab.tab_id());
+                }
+
+                pane
+            }
+        };
+
+        tab.split_and_insert(pane_index, split_request, Rc::clone(&pane))?;
         Ok(pane)
     }
 
     async fn spawn_pane(
         &self,
-        size: PtySize,
+        size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Rc<dyn Pane>>;
@@ -221,7 +255,15 @@ impl LocalDomain {
             // can be painful; in the case where a tab is local but has connected
             // to a remote system and that remote has used OSC 7 to set a path
             // that doesn't exist on the local system, process spawning can fail.
-            if !std::path::Path::new(&dir).exists() {
+            // Another situation is `sudo -i` has the pane with set to a cwd
+            // that is not accessible to the user.
+            if let Err(err) = std::path::Path::new(&dir).read_dir() {
+                log::warn!(
+                    "Directory {:?} is not readable and will not be \
+                     used for the command we are spawning: {:#}",
+                    dir,
+                    err
+                );
                 cmd.clear_cwd();
             }
         }
@@ -262,12 +304,14 @@ impl LocalDomain {
 impl Domain for LocalDomain {
     async fn spawn_pane(
         &self,
-        size: PtySize,
+        size: TerminalSize,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
     ) -> anyhow::Result<Rc<dyn Pane>> {
         let mut cmd = self.build_command(command, command_dir)?;
-        let pair = self.pty_system.openpty(size)?;
+        let pair = self
+            .pty_system
+            .openpty(crate::terminal_size_to_pty_size(size)?)?;
         let pane_id = alloc_pane_id();
         cmd.env("WEZTERM_PANE", pane_id.to_string());
 
@@ -289,7 +333,7 @@ impl Domain for LocalDomain {
         let writer = pair.master.try_clone_writer()?;
 
         let mut terminal = wezterm_term::Terminal::new(
-            crate::pty_size_to_terminal_size(size),
+            size,
             std::sync::Arc::new(config::TermConfig::new()),
             "WezTerm",
             config::wezterm_version(),

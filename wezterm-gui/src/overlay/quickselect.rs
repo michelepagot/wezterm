@@ -5,7 +5,6 @@ use config::ConfigHandle;
 use mux::domain::DomainId;
 use mux::pane::{Pane, PaneId, Pattern, SearchResult};
 use mux::renderable::*;
-use portable_pty::PtySize;
 use rangeset::RangeSet;
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
@@ -17,7 +16,9 @@ use termwiz::color::AnsiColor;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
 use url::Url;
 use wezterm_term::color::ColorPalette;
-use wezterm_term::{Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex};
+use wezterm_term::{
+    Clipboard, KeyCode, KeyModifiers, Line, MouseEvent, StableRowIndex, TerminalSize,
+};
 use window::WindowOps;
 
 const PATTERNS: [&str; 14] = [
@@ -54,7 +55,7 @@ const PATTERNS: [&str; 14] = [
 /// This function computes a set of labels for a given alphabet.
 /// It is derived from https://github.com/fcsonline/tmux-thumbs/blob/master/src/alphabets.rs
 /// which is Copyright (c) 2019 Ferran Basora and provided under the MIT license
-fn compute_labels_for_alphabet(alphabet: &str, num_matches: usize) -> Vec<String> {
+pub fn compute_labels_for_alphabet(alphabet: &str, num_matches: usize) -> Vec<String> {
     let alphabet = alphabet
         .chars()
         .map(|c| c.to_lowercase().to_string())
@@ -191,28 +192,32 @@ impl QuickSelectOverlay {
 
         let config = term_window.config.clone();
 
-        let mut pattern = "(".to_string();
+        let mut pattern = "(?m)(".to_string();
+        let mut have_patterns = false;
         if !args.patterns.is_empty() {
             for p in &args.patterns {
-                if pattern.len() > 1 {
+                if have_patterns {
                     pattern.push('|');
                 }
                 pattern.push_str(p);
+                have_patterns = true;
             }
         } else {
             if !config.disable_default_quick_select_patterns {
                 for p in &PATTERNS {
-                    if pattern.len() > 1 {
+                    if have_patterns {
                         pattern.push('|');
                     }
                     pattern.push_str(p);
+                    have_patterns = true;
                 }
             }
             for p in &config.quick_select_patterns {
-                if pattern.len() > 1 {
+                if have_patterns {
                     pattern.push('|');
                 }
                 pattern.push_str(p);
+                have_patterns = true;
             }
         }
         pattern.push(')');
@@ -240,7 +245,7 @@ impl QuickSelectOverlay {
 
         let search_row = renderer.compute_search_row();
         renderer.dirty_results.add(search_row);
-        renderer.update_search();
+        renderer.update_search(true);
 
         Rc::new(QuickSelectOverlay {
             renderer: RefCell::new(renderer),
@@ -284,7 +289,7 @@ impl Pane for QuickSelectOverlay {
         self.delegate.writer()
     }
 
-    fn resize(&self, size: PtySize) -> anyhow::Result<()> {
+    fn resize(&self, size: TerminalSize) -> anyhow::Result<()> {
         self.delegate.resize(size)
     }
 
@@ -546,7 +551,7 @@ impl QuickSelectRenderable {
         self.height = dims.viewport_rows;
 
         let pos = self.result_pos;
-        self.update_search();
+        self.update_search(false);
         self.result_pos = pos;
     }
 
@@ -628,7 +633,7 @@ impl QuickSelectRenderable {
         }
     }
 
-    fn update_search(&mut self) {
+    fn update_search(&mut self, is_initial_run: bool) {
         for idx in self.by_line.keys() {
             self.dirty_results.add(*idx);
         }
@@ -665,9 +670,21 @@ impl QuickSelectRenderable {
                             let num_results = r.results.len();
 
                             if !r.results.is_empty() {
-                                r.activate_match_number(num_results - 1);
+                                match &r.viewport {
+                                    Some(y) if is_initial_run => {
+                                        r.result_pos = r
+                                            .results
+                                            .iter()
+                                            .position(|result| result.start_y >= *y);
+                                    }
+                                    _ => {
+                                        r.activate_match_number(num_results - 1);
+                                    }
+                                }
                             } else {
-                                r.set_viewport(None);
+                                if !is_initial_run {
+                                    r.set_viewport(None);
+                                }
                                 r.clear_selection();
                             }
                         }
@@ -677,7 +694,9 @@ impl QuickSelectRenderable {
             })
             .detach();
         } else {
-            self.set_viewport(None);
+            if !is_initial_run {
+                self.set_viewport(None);
+            }
             self.clear_selection();
         }
     }
@@ -703,19 +722,16 @@ impl QuickSelectRenderable {
                 if let Some(pane) = mux.get_pane(pane_id) {
                     {
                         let mut selection = term_window.selection(pane_id);
-                        let start = SelectionCoordinate {
-                            x: result.start_x,
-                            y: result.start_y,
-                        };
+                        let start = SelectionCoordinate::x_y(result.start_x, result.start_y);
                         selection.origin = Some(start);
                         selection.range = Some(SelectionRange {
                             start,
-                            end: SelectionCoordinate {
-                                // inclusive range for selection, but the result
-                                // range is exclusive
-                                x: result.end_x.saturating_sub(1),
-                                y: result.end_y,
-                            },
+                            // inclusive range for selection, but the result
+                            // range is exclusive
+                            end: SelectionCoordinate::x_y(
+                                result.end_x.saturating_sub(1),
+                                result.end_y,
+                            ),
                         });
                         // Ensure that selection doesn't get invalidated when
                         // the overlay is closed

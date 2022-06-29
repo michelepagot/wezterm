@@ -105,9 +105,15 @@ pub fn window_mods_to_termwiz_mods(modifiers: ::window::Modifiers) -> termwiz::i
     if modifiers.contains(::window::Modifiers::LEFT_ALT) {
         result.insert(termwiz::input::Modifiers::ALT);
     }
+    /* We DONT want to do this: we carry through RIGHT_ALT
+     * only for win32-input mode to track when AltGr was used,
+     * but we don't want that to be treated as regular ALT
+     * when encoding regular input for the terminal.
+     * <https://github.com/wez/wezterm/issues/2127>
     if modifiers.contains(::window::Modifiers::RIGHT_ALT) {
         result.insert(termwiz::input::Modifiers::ALT);
     }
+    */
     if modifiers.contains(::window::Modifiers::ALT) {
         result.insert(termwiz::input::Modifiers::ALT);
     }
@@ -276,6 +282,13 @@ impl super::TermWindow {
                             term_key,
                             tw_raw_modifiers
                         );
+                    }
+
+                    if let Some(modal) = self.get_modal() {
+                        if is_down {
+                            return modal.key_down(term_key, tw_raw_modifiers, self).is_ok();
+                        }
+                        return false;
                     }
 
                     let res = if is_down {
@@ -510,6 +523,13 @@ impl super::TermWindow {
                         key,
                         modifiers
                     );
+                }
+
+                if let Some(modal) = self.get_modal() {
+                    if window_key.key_is_down {
+                        modal.key_down(key, modifiers, self).ok();
+                    }
+                    return;
                 }
 
                 let res = if let Some(encoded) = self.encode_win32_input(&pane, &window_key) {

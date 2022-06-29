@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::os::unix::io::AsRawFd;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use x11::xlib;
 use xcb::x::Atom;
+use xcb::{dri2, Raw};
 
 pub struct XConnection {
     pub conn: xcb::Connection,
@@ -54,6 +56,7 @@ pub struct XConnection {
     pub(crate) ime: RefCell<std::pin::Pin<Box<xcb_imdkit::ImeClient>>>,
     pub(crate) ime_process_event_result: RefCell<anyhow::Result<()>>,
     pub(crate) has_randr: bool,
+    pub(crate) atom_names: RefCell<HashMap<Atom, String>>,
 }
 
 impl std::ops::Deref for XConnection {
@@ -92,6 +95,7 @@ fn window_id_from_event(event: &xcb::Event) -> Option<xcb::x::Window> {
     match event {
         xcb::Event::X(xcb::x::Event::Expose(e)) => Some(e.window()),
         xcb::Event::X(xcb::x::Event::ConfigureNotify(e)) => Some(e.window()),
+        xcb::Event::Present(xcb::present::Event::ConfigureNotify(e)) => Some(e.window()),
         xcb::Event::X(xcb::x::Event::KeyPress(e)) => Some(e.event()),
         xcb::Event::X(xcb::x::Event::KeyRelease(e)) => Some(e.event()),
         xcb::Event::X(xcb::x::Event::MotionNotify(e)) => Some(e.event()),
@@ -167,7 +171,7 @@ impl ConnectionOps for XConnection {
             // The locally queued events won't mark the fd as ready, so we
             // could potentially sleep when there is work to be done if we
             // relied solely on that.
-            self.process_queued_xcb()?;
+            self.process_queued_xcb().context("process_queued_xcb")?;
 
             // Check the spawn queue before we try to sleep; there may
             // be work pending and we don't guarantee that there is a
@@ -179,7 +183,8 @@ impl ConnectionOps for XConnection {
                 continue;
             }
 
-            self.dispatch_pending_events()?;
+            self.dispatch_pending_events()
+                .context("dispatch_pending_events")?;
             if let Err(err) = poll.poll(&mut events, None) {
                 if err.kind() == std::io::ErrorKind::Interrupted {
                     continue;
@@ -245,17 +250,23 @@ impl XConnection {
                 return Err(err);
             }
         }
-        self.conn.flush()?;
+        self.conn.flush().context("flushing pending requests")?;
 
         loop {
-            match self.conn.poll_for_queued_event()? {
+            match self
+                .conn
+                .poll_for_queued_event()
+                .context("poll_for_queued_event")?
+            {
                 None => {
-                    self.conn.flush()?;
+                    self.conn.flush().context("flushing pending requests")?;
                     return Ok(());
                 }
-                Some(event) => self.process_xcb_event_ime(&event)?,
+                Some(event) => self
+                    .process_xcb_event_ime(&event)
+                    .context("process_xcb_event_ime")?,
             }
-            self.conn.flush()?;
+            self.conn.flush().context("flushing pending requests")?;
         }
     }
 
@@ -270,7 +281,40 @@ impl XConnection {
         }
     }
 
+    unsafe fn rewire_event(&self, raw_ev: *mut xcb::ffi::xcb_generic_event_t) {
+        let ev_type = ((*raw_ev).response_type & 0x7f) as i32;
+
+        if let Some(func) = xlib::XESetWireToEvent(self.conn.get_raw_dpy(), ev_type, None) {
+            xlib::XESetWireToEvent(self.conn.get_raw_dpy(), ev_type, Some(func));
+            (*raw_ev).sequence = xlib::XLastKnownRequestProcessed(self.conn.get_raw_dpy()) as u16;
+            let mut dummy: xlib::XEvent = std::mem::zeroed();
+            func(
+                self.conn.get_raw_dpy(),
+                &mut dummy as *mut xlib::XEvent,
+                raw_ev as *mut xlib::xEvent,
+            );
+        }
+    }
+
     fn process_xcb_event(&self, event: &xcb::Event) -> anyhow::Result<()> {
+        match event {
+            // Following stuff is not obvious at all.
+            // This was necessary in the past to handle GL when XCB owns the event queue.
+            // It may not be necessary anymore, but it is included here
+            // because <https://github.com/wez/wezterm/issues/1992> is a resize related
+            // issue and it might possibly be related to these dri2 related issues:
+            // <https://bugs.freedesktop.org/show_bug.cgi?id=35945#c4>
+            // and mailing thread starting here:
+            // <http://lists.freedesktop.org/archives/xcb/2015-November/010556.html>
+            xcb::Event::Dri2(dri2::Event::BufferSwapComplete(ev)) => unsafe {
+                self.rewire_event(ev.as_raw())
+            },
+            xcb::Event::Dri2(dri2::Event::InvalidateBuffers(ev)) => unsafe {
+                self.rewire_event(ev.as_raw())
+            },
+            _ => {}
+        }
+
         if let Some(window_id) = window_id_from_event(event) {
             self.process_window_event(window_id, event)?;
         } else if matches!(event, xcb::Event::Xkb(_)) {
@@ -324,11 +368,12 @@ impl XConnection {
         let (conn, screen_num) = xcb::Connection::connect_with_xlib_display_and_extensions(
             &[xcb::Extension::Xkb],
             &[
+                xcb::Extension::Present,
                 xcb::Extension::RandR,
                 xcb::Extension::Render,
-                xcb::Extension::Xkb,
             ],
         )?;
+        conn.set_event_queue_owner(xcb::EventQueueOwner::Xcb);
 
         let atom_protocols = Self::intern_atom(&conn, "WM_PROTOCOLS")?;
         let atom_delete = Self::intern_atom(&conn, "WM_DELETE_WINDOW")?;
@@ -417,12 +462,17 @@ impl XConnection {
         let default_dpi = RefCell::new(compute_default_dpi(&xrm, &xsettings));
         log::trace!("computed initial dpi: {:?}", default_dpi);
 
+        let input_style = match config::configuration().ime_preedit_rendering {
+            config::ImePreeditRendering::Builtin => xcb_imdkit::InputStyle::PREEDIT_CALLBACKS,
+            config::ImePreeditRendering::System => xcb_imdkit::InputStyle::DEFAULT,
+        };
+
         xcb_imdkit::ImeClient::set_logger(|msg| log::debug!("Ime: {}", msg));
         let ime = unsafe {
             xcb_imdkit::ImeClient::unsafe_new(
                 &conn,
                 screen_num,
-                xcb_imdkit::InputStyle::PREEDIT_CALLBACKS,
+                input_style,
                 config::configuration().xim_im_name.as_deref(),
             )
         };
@@ -465,6 +515,7 @@ impl XConnection {
             ime: RefCell::new(ime),
             ime_process_event_result: RefCell::new(Ok(())),
             has_randr,
+            atom_names: RefCell::new(HashMap::new()),
         });
 
         {
@@ -479,7 +530,7 @@ impl XConnection {
                     }
                 });
         }
-        {
+        if config::configuration().ime_preedit_rendering == config::ImePreeditRendering::Builtin {
             let conn = conn.clone();
             conn.clone()
                 .ime
@@ -494,7 +545,7 @@ impl XConnection {
                     }
                 });
         }
-        {
+        if config::configuration().ime_preedit_rendering == config::ImePreeditRendering::Builtin {
             let conn = conn.clone();
             conn.clone()
                 .ime
@@ -521,6 +572,53 @@ impl XConnection {
         }
 
         Ok(conn)
+    }
+
+    pub(crate) fn send_and_wait_request<R>(
+        &self,
+        req: &R,
+    ) -> anyhow::Result<<<R as xcb::Request>::Cookie as xcb::CookieWithReplyChecked>::Reply>
+    where
+        R: xcb::Request + std::fmt::Debug,
+        R::Cookie: xcb::CookieWithReplyChecked,
+    {
+        let cookie = self.conn.send_request(req);
+        self.conn
+            .wait_for_reply(cookie)
+            .with_context(|| format!("{req:#?}"))
+    }
+
+    pub(crate) fn send_request_no_reply<R>(&self, req: &R) -> anyhow::Result<()>
+    where
+        R: xcb::RequestWithoutReply + std::fmt::Debug,
+    {
+        self.conn
+            .send_and_check_request(req)
+            .with_context(|| format!("{req:#?}"))
+    }
+
+    pub(crate) fn send_request_no_reply_log<R>(&self, req: &R)
+    where
+        R: xcb::RequestWithoutReply + std::fmt::Debug,
+    {
+        if let Err(err) = self.send_request_no_reply(req) {
+            log::error!("{err:#}");
+        }
+    }
+
+    pub fn atom_name(&self, atom: Atom) -> String {
+        if let Some(name) = self.atom_names.borrow().get(&atom) {
+            return name.to_string();
+        }
+        let cookie = self.conn.send_request(&xcb::x::GetAtomName { atom });
+        let name = if let Ok(reply) = self.conn.wait_for_reply(cookie) {
+            reply.name().to_string()
+        } else {
+            format!("{:?}", atom)
+        };
+
+        self.atom_names.borrow_mut().insert(atom, name.to_string());
+        name
     }
 
     pub fn conn(&self) -> &xcb::Connection {
@@ -551,7 +649,11 @@ impl XConnection {
         promise::spawn::spawn_into_main_thread(async move {
             if let Some(handle) = Connection::get().unwrap().x11().window_by_id(window) {
                 let mut inner = handle.lock().unwrap();
-                prom.result(f(&mut inner));
+                if inner.window_id != window {
+                    prom.result(Err(anyhow!("window {window:?} has been destroyed")));
+                } else {
+                    prom.result(f(&mut inner));
+                }
             }
         })
         .detach();

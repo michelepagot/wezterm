@@ -1219,7 +1219,7 @@ enum TranslateStatus {
 /// Holds state needed to perform keymap translation.
 struct Keyboard {
     _kbd: InputSource,
-    layout_data: CFData,
+    layout_data: Option<CFData>,
 }
 
 /// Slightly more intelligible parameters for keymap translation
@@ -1244,18 +1244,26 @@ impl Keyboard {
             unsafe { InputSource::wrap_under_create_rule(TISCopyCurrentKeyboardInputSource()) };
 
         let layout_data = unsafe {
-            CFData::wrap_under_get_rule(TISGetInputSourceProperty(
+            let data = TISGetInputSourceProperty(
                 _kbd.as_concrete_TypeRef(),
                 kTISPropertyUnicodeKeyLayoutData,
-            ))
+            );
+            if data.is_null() {
+                None
+            } else {
+                Some(CFData::wrap_under_get_rule(data))
+            }
         };
         Self { _kbd, layout_data }
     }
 
     /// A wrapper around UCKeyTranslate
     pub fn translate(&self, params: TranslateParams) -> anyhow::Result<TranslateResults> {
-        let layout_data = unsafe {
-            CFDataGetBytePtr(self.layout_data.as_concrete_TypeRef()) as *const UCKeyboardLayout
+        let layout_data = match &self.layout_data {
+            Some(data) => unsafe {
+                CFDataGetBytePtr(data.as_concrete_TypeRef()) as *const UCKeyboardLayout
+            },
+            None => std::ptr::null(),
         };
 
         let modifier_key_state: u32 = (params.modifier_flags.bits() >> 16) as u32 & 0xFF;
@@ -1714,10 +1722,9 @@ impl WindowView {
             range,
             actual
         );
-        let frame = unsafe {
-            let window: id = msg_send![this, window];
-            NSWindow::frame(window)
-        };
+        let window: id = unsafe { msg_send![this, window] };
+        let frame = unsafe { NSWindow::frame(window) };
+        let content: NSRect = unsafe { msg_send![window, contentRectForFrameRect: frame] };
         let backing_frame: NSRect = unsafe { msg_send![this, convertRectToBacking: frame] };
         let scale = frame.size.width / backing_frame.size.width;
 
@@ -1731,11 +1738,8 @@ impl WindowView {
 
             NSRect::new(
                 NSPoint::new(
-                    frame.origin.x + cursor_pos.origin.x,
-                    // Position below the text so that drop-downs
-                    // don't obscure the text in the terminal
-                    frame.origin.y + frame.size.height
-                        - (cursor_pos.max_y() + cursor_pos.size.height * 2.5),
+                    content.origin.x + cursor_pos.min_x(),
+                    content.origin.y + content.size.height - cursor_pos.max_y(),
                 ),
                 NSSize::new(cursor_pos.size.width, cursor_pos.size.height),
             )
@@ -2050,7 +2054,7 @@ impl WindowView {
         // Shift-Tab on macOS produces \x19 for some reason.
         // Rewrite it to something we understand.
         // <https://github.com/wez/wezterm/issues/1902>
-        let chars = if virtual_key == kVK_Tab && modifiers == Modifiers::SHIFT {
+        let chars = if virtual_key == kVK_Tab && modifiers.contains(Modifiers::SHIFT) {
             "\t"
         } else {
             chars
@@ -2366,6 +2370,7 @@ impl WindowView {
         if (chars == "." && modifiers == Modifiers::SUPER)
             || (chars == "\u{1b}" && modifiers == Modifiers::CTRL)
             || (chars == "\t" && modifiers == Modifiers::CTRL)
+            || (chars == "\x19"/* Shift-Tab: See issue #1902 */)
         {
             // Synthesize a key down event for this, because macOS will
             // not do that, even though we tell it that we handled this event.

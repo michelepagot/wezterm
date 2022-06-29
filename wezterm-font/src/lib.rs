@@ -59,6 +59,9 @@ pub struct LoadedFont {
     pending_fallback: Arc<Mutex<Vec<ParsedFont>>>,
     text_style: TextStyle,
     id: LoadedFontId,
+    /// Glyphs for which no font was found and for which we should
+    /// stop searching
+    tried_glyphs: RefCell<HashSet<char>>,
 }
 
 impl std::fmt::Debug for LoadedFont {
@@ -210,6 +213,15 @@ impl LoadedFont {
 
         no_glyphs.retain(|&c| c != '\u{FE0F}' && c != '\u{FE0E}');
         filter_out_synthetic(&mut no_glyphs);
+
+        let mut tried_glyphs = self.tried_glyphs.borrow_mut();
+        no_glyphs.retain(|c| !tried_glyphs.contains(c));
+        for c in &no_glyphs {
+            tried_glyphs.insert(*c);
+        }
+
+        no_glyphs.sort();
+        no_glyphs.dedup();
 
         let mut async_resolve = false;
 
@@ -427,8 +439,8 @@ struct FontConfigInner {
     locator: Arc<dyn FontLocator + Send + Sync>,
     font_dirs: RefCell<Arc<FontDatabase>>,
     built_in: RefCell<Arc<FontDatabase>>,
-    no_glyphs: RefCell<HashSet<char>>,
     title_font: RefCell<Option<Rc<LoadedFont>>>,
+    pane_select_font: RefCell<Option<Rc<LoadedFont>>>,
     fallback_channel: RefCell<Option<Sender<FallbackResolveInfo>>>,
 }
 
@@ -447,12 +459,12 @@ impl FontConfigInner {
             locator,
             metrics: RefCell::new(None),
             title_font: RefCell::new(None),
+            pane_select_font: RefCell::new(None),
             font_scale: RefCell::new(1.0),
             dpi: RefCell::new(dpi),
             config: RefCell::new(config.clone()),
             font_dirs: RefCell::new(Arc::new(FontDatabase::with_font_dirs(&config)?)),
             built_in: RefCell::new(Arc::new(FontDatabase::with_built_in()?)),
-            no_glyphs: RefCell::new(HashSet::new()),
             fallback_channel: RefCell::new(None),
         })
     }
@@ -463,23 +475,18 @@ impl FontConfigInner {
         // Config was reloaded, invalidate our caches
         fonts.clear();
         self.title_font.borrow_mut().take();
+        self.pane_select_font.borrow_mut().take();
         self.metrics.borrow_mut().take();
-        self.no_glyphs.borrow_mut().clear();
         *self.font_dirs.borrow_mut() = Arc::new(FontDatabase::with_font_dirs(config)?);
         Ok(())
     }
 
     fn schedule_fallback_resolve<F: FnOnce() + Send + 'static>(
         &self,
-        mut no_glyphs: Vec<char>,
+        no_glyphs: Vec<char>,
         pending: &Arc<Mutex<Vec<ParsedFont>>>,
         completion: F,
     ) {
-        let mut ng = self.no_glyphs.borrow_mut();
-        no_glyphs.retain(|c| !ng.contains(c));
-        for c in &no_glyphs {
-            ng.insert(*c);
-        }
         if no_glyphs.is_empty() {
             return;
         }
@@ -544,18 +551,15 @@ impl FontConfigInner {
         )
     }
 
-    fn title_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+    fn make_title_font_impl(
+        &self,
+        myself: &Rc<Self>,
+        pref_size: Option<f64>,
+    ) -> anyhow::Result<Rc<LoadedFont>> {
         let config = self.config.borrow();
-
-        let mut title_font = self.title_font.borrow_mut();
-
-        if let Some(entry) = title_font.as_ref() {
-            return Ok(Rc::clone(entry));
-        }
-
         let (sys_font, sys_size) = self.compute_title_font(&config);
 
-        let font_size = config.window_frame.font_size.unwrap_or(sys_size);
+        let font_size = pref_size.unwrap_or(sys_size);
 
         let text_style = config
             .window_frame
@@ -589,9 +593,40 @@ impl FontConfigInner {
             pending_fallback: Arc::new(Mutex::new(vec![])),
             text_style: text_style.clone(),
             id: alloc_font_id(),
+            tried_glyphs: RefCell::new(HashSet::new()),
         });
 
+        Ok(loaded)
+    }
+
+    fn title_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let config = self.config.borrow();
+
+        let mut title_font = self.title_font.borrow_mut();
+
+        if let Some(entry) = title_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_title_font_impl(myself, config.window_frame.font_size)?;
+
         title_font.replace(Rc::clone(&loaded));
+
+        Ok(loaded)
+    }
+
+    fn pane_select_font(&self, myself: &Rc<Self>) -> anyhow::Result<Rc<LoadedFont>> {
+        let config = self.config.borrow();
+
+        let mut pane_select_font = self.pane_select_font.borrow_mut();
+
+        if let Some(entry) = pane_select_font.as_ref() {
+            return Ok(Rc::clone(entry));
+        }
+
+        let loaded = self.make_title_font_impl(myself, Some(config.pane_select_font_size))?;
+
+        pane_select_font.replace(Rc::clone(&loaded));
 
         Ok(loaded)
     }
@@ -824,6 +859,7 @@ impl FontConfigInner {
             pending_fallback: Arc::new(Mutex::new(vec![])),
             text_style: style.clone(),
             id: alloc_font_id(),
+            tried_glyphs: RefCell::new(HashSet::new()),
         });
 
         fonts.insert(style.clone(), Rc::clone(&loaded));
@@ -839,7 +875,6 @@ impl FontConfigInner {
         *self.font_scale.borrow_mut() = font_scale;
         self.fonts.borrow_mut().clear();
         self.metrics.borrow_mut().take();
-        self.no_glyphs.borrow_mut().clear();
         self.title_font.borrow_mut().take();
 
         (prior_font, prior_dpi)
@@ -932,6 +967,10 @@ impl FontConfiguration {
 
     pub fn title_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
         self.inner.title_font(&self.inner)
+    }
+
+    pub fn pane_select_font(&self) -> anyhow::Result<Rc<LoadedFont>> {
+        self.inner.pane_select_font(&self.inner)
     }
 
     /// Given a text style, load (with caching) the font that best

@@ -596,7 +596,7 @@ impl Reconnectable {
         let mut child = exec.child;
         std::thread::spawn(move || match child.wait() {
             Err(err) => log::error!("waiting on {} failed: {:#}", cmd, err),
-            Ok(status) if !status.success() => log::error!("{} failed", cmd),
+            Ok(status) if !status.success() => log::error!("{}: {}", cmd, status),
             _ => {}
         });
 
@@ -1186,6 +1186,11 @@ impl Client {
     rpc!(list_panes, ListPanes = (), ListPanesResponse);
     rpc!(spawn_v2, SpawnV2, SpawnResponse);
     rpc!(split_pane, SplitPane, SpawnResponse);
+    rpc!(
+        move_pane_to_new_tab,
+        MovePaneToNewTab,
+        MovePaneToNewTabResponse
+    );
     rpc!(write_to_pane, WriteToPane, UnitResponse);
     rpc!(send_paste, SendPaste, UnitResponse);
     rpc!(key_down, SendKeyDown, UnitResponse);

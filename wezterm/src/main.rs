@@ -1,10 +1,12 @@
 use anyhow::{anyhow, Context};
 use chrono::{DateTime, Utc};
+use clap::{Parser, ValueHint};
+use clap_complete::{generate as generate_completion, Shell};
 use config::keyassignment::SpawnTabDomain;
 use config::wezterm_version;
 use mux::activity::Activity;
 use mux::pane::PaneId;
-use mux::tab::SplitDirection;
+use mux::tab::{SplitDirection, SplitRequest, SplitSize};
 use mux::window::WindowId;
 use mux::Mux;
 use portable_pty::cmdbuilder::CommandBuilder;
@@ -12,116 +14,127 @@ use serde::Serializer as _;
 use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::rc::Rc;
-use structopt::StructOpt;
 use tabout::{tabulate_output, Alignment, Column};
 use umask::UmaskSaver;
 use wezterm_client::client::{unix_connect_with_retry, Client};
 use wezterm_gui_subcommands::*;
+use wezterm_term::TerminalSize;
 
 mod asciicast;
 
 //    let message = "; ❤ 😍🤢\n\x1b[91;mw00t\n\x1b[37;104;m bleet\x1b[0;m.";
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     about = "Wez's Terminal Emulator\nhttp://github.com/wez/wezterm",
-    global_setting = structopt::clap::AppSettings::ColoredHelp,
     version = wezterm_version()
 )]
 struct Opt {
     /// Skip loading wezterm.lua
-    #[structopt(name = "skip-config", short = "n")]
+    #[clap(name = "skip-config", short = 'n')]
     skip_config: bool,
 
     /// Specify the configuration file to use, overrides the normal
     /// configuration file resolution
-    #[structopt(
+    #[clap(
         long = "config-file",
         parse(from_os_str),
-        conflicts_with = "skip-config"
+        conflicts_with = "skip-config",
+        value_hint=ValueHint::FilePath
     )]
     config_file: Option<OsString>,
 
     /// Override specific configuration values
-    #[structopt(
+    #[clap(
         long = "config",
         name = "name=value",
         parse(try_from_str = name_equals_value),
         number_of_values = 1)]
     config_override: Vec<(String, String)>,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     cmd: Option<SubCommand>,
 }
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 enum SubCommand {
-    #[structopt(
+    #[clap(
         name = "start",
         about = "Start the GUI, optionally running an alternative program"
     )]
     Start(StartCommand),
 
-    #[structopt(name = "ssh", about = "Establish an ssh session")]
+    #[clap(name = "ssh", about = "Establish an ssh session")]
     Ssh(SshCommand),
 
-    #[structopt(name = "serial", about = "Open a serial port")]
+    #[clap(name = "serial", about = "Open a serial port")]
     Serial(SerialCommand),
 
-    #[structopt(name = "connect", about = "Connect to wezterm multiplexer")]
+    #[clap(name = "connect", about = "Connect to wezterm multiplexer")]
     Connect(ConnectCommand),
 
-    #[structopt(name = "ls-fonts", about = "Display information about fonts")]
+    #[clap(name = "ls-fonts", about = "Display information about fonts")]
     LsFonts(LsFontsCommand),
 
-    #[structopt(name = "cli", about = "Interact with experimental mux server")]
+    #[clap(name = "show-keys", about = "Show key assignments")]
+    ShowKeys(ShowKeysCommand),
+
+    #[clap(name = "cli", about = "Interact with experimental mux server")]
     Cli(CliCommand),
 
-    #[structopt(name = "imgcat", about = "Output an image to the terminal")]
+    #[clap(name = "imgcat", about = "Output an image to the terminal")]
     ImageCat(ImgCatCommand),
 
-    #[structopt(
+    #[clap(
         name = "set-working-directory",
         about = "Advise the terminal of the current working directory by \
                  emitting an OSC 7 escape sequence"
     )]
     SetCwd(SetCwdCommand),
 
-    #[structopt(name = "record", about = "Record a terminal session as an asciicast")]
+    #[clap(name = "record", about = "Record a terminal session as an asciicast")]
     Record(asciicast::RecordCommand),
 
-    #[structopt(name = "replay", about = "Replay an asciicast terminal session")]
+    #[clap(name = "replay", about = "Replay an asciicast terminal session")]
     Replay(asciicast::PlayCommand),
+
+    /// Generate shell completion information
+    #[clap(name = "shell-completion")]
+    ShellCompletion {
+        /// Which shell to generate for
+        #[clap(long, possible_values=["bash", "elvish", "fish", "powershell", "zsh"])]
+        shell: Shell,
+    },
 }
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 struct CliCommand {
     /// Don't automatically start the server
-    #[structopt(long = "no-auto-start")]
+    #[clap(long = "no-auto-start")]
     no_auto_start: bool,
 
     /// Prefer connecting to a background mux server.
     /// The default is to prefer connecting to a running
     /// wezterm gui instance
-    #[structopt(long = "prefer-mux")]
+    #[clap(long = "prefer-mux")]
     prefer_mux: bool,
 
     /// When connecting to a gui instance, if you started the
     /// gui with `--class SOMETHING`, you should also pass
     /// that same value here in order for the client to find
     /// the correct gui instance.
-    #[structopt(long = "class")]
+    #[clap(long = "class")]
     class: Option<String>,
 
-    #[structopt(subcommand)]
+    #[clap(subcommand)]
     sub: CliSubCommand,
 }
 
-#[derive(Debug, StructOpt, Clone, Copy)]
+#[derive(Debug, Parser, Clone, Copy)]
 enum CliOutputFormatKind {
-    #[structopt(name = "table", about = "multi line space separated table")]
+    #[clap(name = "table", about = "multi line space separated table")]
     Table,
-    #[structopt(name = "json", about = "JSON format")]
+    #[clap(name = "json", about = "JSON format")]
     Json,
 }
 
@@ -136,30 +149,62 @@ impl std::str::FromStr for CliOutputFormatKind {
     }
 }
 
-#[derive(Debug, StructOpt, Clone, Copy)]
+#[derive(Debug, Parser, Clone, Copy)]
 struct CliOutputFormat {
     /// Controls the output format.
     /// "table" and "json" are possible formats.
-    #[structopt(long = "format", default_value = "table")]
+    #[clap(long = "format", default_value = "table")]
     format: CliOutputFormatKind,
 }
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 enum CliSubCommand {
-    #[structopt(name = "list", about = "list windows, tabs and panes")]
+    #[clap(name = "list", about = "list windows, tabs and panes")]
     List(CliOutputFormat),
 
-    #[structopt(name = "list-clients", about = "list clients")]
+    #[clap(name = "list-clients", about = "list clients")]
     ListClients(CliOutputFormat),
 
-    #[structopt(name = "proxy", about = "start rpc proxy pipe")]
+    #[clap(name = "proxy", about = "start rpc proxy pipe")]
     Proxy,
 
-    #[structopt(name = "tlscreds", about = "obtain tls credentials")]
+    #[clap(name = "tlscreds", about = "obtain tls credentials")]
     TlsCreds,
 
-    #[structopt(
+    #[clap(
+        name = "move-pane-to-new-tab",
+        rename_all = "kebab",
+        about = "Move a pane into a new tab"
+    )]
+    MovePaneToNewTab {
+        /// Specify the pane that should be moved.
+        /// The default is to use the current pane based on the
+        /// environment variable WEZTERM_PANE.
+        #[clap(long)]
+        pane_id: Option<PaneId>,
+
+        /// Specify the window into which the new tab will be
+        /// created.
+        /// If omitted, the window associated with the current
+        /// pane is used.
+        #[clap(long)]
+        window_id: Option<WindowId>,
+
+        /// Create tab in a new window, rather than the window
+        /// currently containing the pane.
+        #[clap(long, conflicts_with = "window-id")]
+        new_window: bool,
+
+        /// If creating a new window, override the default workspace name
+        /// with the provided name.  The default name is "default".
+        #[clap(long)]
+        workspace: Option<String>,
+    },
+
+    #[clap(
         name = "split-pane",
+        rename_all = "kebab",
+        trailing_var_arg = true,
         about = "split the current pane.
 Outputs the pane-id for the newly created pane on success"
     )]
@@ -167,27 +212,65 @@ Outputs the pane-id for the newly created pane on success"
         /// Specify the pane that should be split.
         /// The default is to use the current pane based on the
         /// environment variable WEZTERM_PANE.
-        #[structopt(long = "pane-id")]
+        #[clap(long)]
         pane_id: Option<PaneId>,
 
-        /// Split horizontally rather than vertically
-        #[structopt(long = "horizontal")]
+        /// Equivalent to `--right`. If neither this nor any other direction
+        /// is specified, the default is equivalent to `--bottom`.
+        #[clap(long, conflicts_with_all=&["left", "right", "top", "bottom"])]
         horizontal: bool,
+
+        /// Split horizontally, with the new pane on the left
+        #[clap(long, conflicts_with_all=&["right", "top", "bottom"])]
+        left: bool,
+
+        /// Split horizontally, with the new pane on the right
+        #[clap(long, conflicts_with_all=&["left", "top", "bottom"])]
+        right: bool,
+
+        /// Split vertically, with the new pane on the top
+        #[clap(long, conflicts_with_all=&["left", "right", "bottom"])]
+        top: bool,
+
+        /// Split vertically, with the new pane on the bottom
+        #[clap(long, conflicts_with_all=&["left", "right", "top"])]
+        bottom: bool,
+
+        /// Rather than splitting the active pane, split the entire
+        /// window.
+        #[clap(long)]
+        top_level: bool,
+
+        /// The number of cells that the new split should have.
+        /// If omitted, 50% of the available space is used.
+        #[clap(long)]
+        cells: Option<usize>,
+
+        /// Specify the number of cells that the new split should
+        /// have, expressed as a percentage of the available space.
+        #[clap(long, conflicts_with = "cells")]
+        percent: Option<u8>,
 
         /// Specify the current working directory for the initially
         /// spawned program
-        #[structopt(long = "cwd", parse(from_os_str))]
+        #[clap(long, parse(from_os_str), value_hint=ValueHint::DirPath)]
         cwd: Option<OsString>,
 
+        /// Instead of spawning a new command, move the specified
+        /// pane into the newly created split.
+        #[clap(long, conflicts_with_all=&["cwd", "prog"])]
+        move_pane_id: Option<PaneId>,
+
         /// Instead of executing your shell, run PROG.
-        /// For example: `wezterm start -- bash -l` will spawn bash
+        /// For example: `wezterm cli split-pane -- bash -l` will spawn bash
         /// as if it were a login shell.
-        #[structopt(parse(from_os_str))]
+        #[clap(parse(from_os_str), value_hint=ValueHint::CommandWithArguments, multiple_values=true)]
         prog: Vec<OsString>,
     },
 
-    #[structopt(
+    #[clap(
         name = "spawn",
+        trailing_var_arg = true,
         about = "Spawn a command into a new window or tab
 Outputs the pane-id for the newly created pane on success"
     )]
@@ -197,49 +280,53 @@ Outputs the pane-id for the newly created pane on success"
         /// environment variable WEZTERM_PANE.
         /// The pane is used to determine the current domain
         /// and window.
-        #[structopt(long = "pane-id")]
+        #[clap(long = "pane-id")]
         pane_id: Option<PaneId>,
 
-        #[structopt(long = "domain-name")]
+        #[clap(long = "domain-name")]
         domain_name: Option<String>,
 
         /// Specify the window into which to spawn a tab.
         /// If omitted, the window associated with the current
         /// pane is used.
-        #[structopt(long = "window-id")]
+        #[clap(long = "window-id")]
         window_id: Option<WindowId>,
 
         /// Spawn into a new window, rather than a new tab
-        #[structopt(long = "new-window", conflicts_with = "window_id")]
+        #[clap(long = "new-window", conflicts_with = "window-id")]
         new_window: bool,
 
         /// Specify the current working directory for the initially
         /// spawned program
-        #[structopt(long = "cwd", parse(from_os_str))]
+        #[clap(long = "cwd", parse(from_os_str), value_hint=ValueHint::DirPath)]
         cwd: Option<OsString>,
 
         /// When creating a new window, override the default workspace name
         /// with the provided name.  The default name is "default".
-        #[structopt(long = "workspace")]
+        #[clap(long = "workspace")]
         workspace: Option<String>,
 
         /// Instead of executing your shell, run PROG.
-        /// For example: `wezterm start -- bash -l` will spawn bash
+        /// For example: `wezterm cli spawn -- bash -l` will spawn bash
         /// as if it were a login shell.
-        #[structopt(parse(from_os_str))]
+        #[clap(parse(from_os_str), value_hint=ValueHint::CommandWithArguments, multiple_values=true)]
         prog: Vec<OsString>,
     },
 
     /// Send text to a pane as though it were pasted.
     /// If bracketed paste mode is enabled in the pane, then the
     /// text will be sent as a bracketed paste.
-    #[structopt(name = "send-text")]
+    #[clap(name = "send-text", rename_all = "kebab")]
     SendText {
         /// Specify the target pane.
         /// The default is to use the current pane based on the
         /// environment variable WEZTERM_PANE.
-        #[structopt(long = "pane-id")]
+        #[clap(long)]
         pane_id: Option<PaneId>,
+
+        /// Send the text directly, rather than as a bracketed paste.
+        #[clap(long)]
+        no_paste: bool,
 
         /// The text to send. If omitted, will read the text from stdin.
         text: Option<String>,
@@ -250,27 +337,27 @@ use termwiz::escape::osc::{
     ITermDimension, ITermFileData, ITermProprietary, OperatingSystemCommand,
 };
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 struct ImgCatCommand {
     /// Specify the display width; defaults to "auto" which automatically selects
     /// an appropriate size.  You may also use an integer value `N` to specify the
     /// number of cells, or `Npx` to specify the number of pixels, or `N%` to
     /// size relative to the terminal width.
-    #[structopt(long = "width")]
+    #[clap(long = "width")]
     width: Option<ITermDimension>,
     /// Specify the display height; defaults to "auto" which automatically selects
     /// an appropriate size.  You may also use an integer value `N` to specify the
     /// number of cells, or `Npx` to specify the number of pixels, or `N%` to
     /// size relative to the terminal height.
-    #[structopt(long = "height")]
+    #[clap(long = "height")]
     height: Option<ITermDimension>,
     /// Do not respect the aspect ratio.  The default is to respect the aspect
     /// ratio
-    #[structopt(long = "no-preserve-aspect-ratio")]
+    #[clap(long = "no-preserve-aspect-ratio")]
     no_preserve_aspect_ratio: bool,
     /// The name of the image file to be displayed.
     /// If omitted, will attempt to read it from stdin.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str), value_hint=ValueHint::FilePath)]
     file_name: Option<OsString>,
 }
 
@@ -304,16 +391,16 @@ impl ImgCatCommand {
     }
 }
 
-#[derive(Debug, StructOpt, Clone)]
+#[derive(Debug, Parser, Clone)]
 struct SetCwdCommand {
     /// The directory to specify.
     /// If omitted, will use the current directory of the process itself.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str), value_hint=ValueHint::DirPath)]
     cwd: Option<OsString>,
 
     /// The hostname to use in the constructed file:// URL.
     /// If omitted, the system hostname will be used.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str), value_hint=ValueHint::Hostname)]
     host: Option<OsString>,
 }
 
@@ -374,12 +461,12 @@ fn run() -> anyhow::Result<()> {
 
     let saver = UmaskSaver::new();
 
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
         opts.skip_config,
-    );
+    )?;
     let config = config::configuration();
 
     match opts
@@ -390,6 +477,7 @@ fn run() -> anyhow::Result<()> {
     {
         SubCommand::Start(_)
         | SubCommand::LsFonts(_)
+        | SubCommand::ShowKeys(_)
         | SubCommand::Ssh(_)
         | SubCommand::Serial(_)
         | SubCommand::Connect(_) => delegate_to_gui(saver),
@@ -398,6 +486,13 @@ fn run() -> anyhow::Result<()> {
         SubCommand::Cli(cli) => run_cli(config, cli),
         SubCommand::Record(cmd) => cmd.run(config),
         SubCommand::Replay(cmd) => cmd.run(),
+        SubCommand::ShellCompletion { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Opt::command();
+            let name = cmd.get_name().to_string();
+            generate_completion(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 
@@ -476,8 +571,8 @@ async fn resolve_pane_id(client: &Client, pane_id: Option<PaneId>) -> anyhow::Re
 
 #[derive(serde::Serialize)]
 struct CliListResultPtySize {
-    rows: u16,
-    cols: u16,
+    rows: usize,
+    cols: usize,
 }
 // This will be serialized to JSON via the 'List' command.
 // As such it is intended to be a stable output format,
@@ -503,7 +598,7 @@ impl From<mux::tab::PaneEntry> for CliListResultItem {
             workspace,
             title,
             working_dir,
-            size: portable_pty::PtySize { rows, cols, .. },
+            size: TerminalSize { rows, cols, .. },
             ..
         } = pane;
 
@@ -738,22 +833,93 @@ async fn run_cli_async(config: config::ConfigHandle, cli: CliCommand) -> anyhow:
                 }
             }
         }
+        CliSubCommand::MovePaneToNewTab {
+            pane_id,
+            window_id,
+            new_window,
+            workspace,
+        } => {
+            let pane_id = resolve_pane_id(&client, pane_id).await?;
+            let window_id = if new_window {
+                None
+            } else {
+                match window_id {
+                    Some(w) => Some(w),
+                    None => {
+                        let panes = client.list_panes().await?;
+                        let mut window_id = None;
+                        'outer_move: for tabroot in panes.tabs {
+                            let mut cursor = tabroot.into_tree().cursor();
+
+                            loop {
+                                if let Some(entry) = cursor.leaf_mut() {
+                                    if entry.pane_id == pane_id {
+                                        window_id.replace(entry.window_id);
+                                        break 'outer_move;
+                                    }
+                                }
+                                match cursor.preorder_next() {
+                                    Ok(c) => cursor = c,
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                        window_id
+                    }
+                }
+            };
+
+            let moved = client
+                .move_pane_to_new_tab(codec::MovePaneToNewTab {
+                    pane_id,
+                    window_id,
+                    workspace_for_new_window: workspace,
+                })
+                .await?;
+
+            log::debug!("{:?}", moved);
+        }
         CliSubCommand::SplitPane {
             pane_id,
             cwd,
             prog,
             horizontal,
+            left,
+            right,
+            top,
+            bottom,
+            top_level,
+            cells,
+            percent,
+            move_pane_id,
         } => {
             let pane_id = resolve_pane_id(&client, pane_id).await?;
+
+            let direction = if left || right || horizontal {
+                SplitDirection::Horizontal
+            } else if top || bottom {
+                SplitDirection::Vertical
+            } else {
+                SplitDirection::Vertical
+            };
+            let target_is_second = !(left || top);
+            let size = match (cells, percent) {
+                (Some(c), _) => SplitSize::Cells(c),
+                (_, Some(p)) => SplitSize::Percent(p),
+                (None, None) => SplitSize::Percent(50),
+            };
+
+            let split_request = SplitRequest {
+                direction,
+                target_is_second,
+                size,
+                top_level,
+            };
 
             let spawned = client
                 .split_pane(codec::SplitPane {
                     pane_id,
-                    direction: if horizontal {
-                        SplitDirection::Horizontal
-                    } else {
-                        SplitDirection::Vertical
-                    },
+                    split_request,
                     domain: config::keyassignment::SpawnTabDomain::CurrentPaneDomain,
                     command: if prog.is_empty() {
                         None
@@ -762,13 +928,18 @@ async fn run_cli_async(config: config::ConfigHandle, cli: CliCommand) -> anyhow:
                         Some(builder)
                     },
                     command_dir: canon_cwd(cwd)?,
+                    move_pane_id,
                 })
                 .await?;
 
             log::debug!("{:?}", spawned);
             println!("{}", spawned.pane_id);
         }
-        CliSubCommand::SendText { pane_id, text } => {
+        CliSubCommand::SendText {
+            pane_id,
+            text,
+            no_paste,
+        } => {
             let pane_id = resolve_pane_id(&client, pane_id).await?;
 
             let data = match text {
@@ -782,9 +953,18 @@ async fn run_cli_async(config: config::ConfigHandle, cli: CliCommand) -> anyhow:
                 }
             };
 
-            client
-                .send_paste(codec::SendPaste { pane_id, data })
-                .await?;
+            if no_paste {
+                client
+                    .write_to_pane(codec::WriteToPane {
+                        pane_id,
+                        data: data.as_bytes().to_vec(),
+                    })
+                    .await?;
+            } else {
+                client
+                    .send_paste(codec::SendPaste { pane_id, data })
+                    .await?;
+            }
         }
         CliSubCommand::SpawnCommand {
             cwd,
@@ -828,6 +1008,8 @@ async fn run_cli_async(config: config::ConfigHandle, cli: CliCommand) -> anyhow:
 
             let workspace = workspace.unwrap_or_else(|| mux::DEFAULT_WORKSPACE.to_string());
 
+            let size = config.initial_size(0);
+
             let spawned = client
                 .spawn_v2(codec::SpawnV2 {
                     domain: domain_name.map_or(SpawnTabDomain::DefaultDomain, |name| {
@@ -841,7 +1023,7 @@ async fn run_cli_async(config: config::ConfigHandle, cli: CliCommand) -> anyhow:
                         Some(builder)
                     },
                     command_dir: canon_cwd(cwd)?,
-                    size: config::configuration().initial_size(),
+                    size,
                     workspace,
                 })
                 .await?;

@@ -1,11 +1,11 @@
 use crate::client::{ClientId, ClientInfo};
 use crate::pane::{Pane, PaneId};
-use crate::tab::{SplitDirection, Tab, TabId};
+use crate::tab::{SplitRequest, Tab, TabId};
 use crate::window::{Window, WindowId};
 use anyhow::{anyhow, Context, Error};
 use config::keyassignment::SpawnTabDomain;
 use config::{configuration, ExitBehavior};
-use domain::{Domain, DomainId, DomainState};
+use domain::{Domain, DomainId, DomainState, SplitSource};
 use filedescriptor::{socketpair, AsRawSocketDescriptor, FileDescriptor};
 #[cfg(unix)]
 use libc::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
@@ -15,6 +15,7 @@ use percent_encoding::percent_decode_str;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize};
 use std::cell::{Ref, RefCell, RefMut};
 use std::collections::HashMap;
+use std::convert::TryInto;
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,7 +25,7 @@ use std::time::Instant;
 use termwiz::escape::csi::{DecPrivateMode, DecPrivateModeCode, Device, Mode};
 use termwiz::escape::{Action, CSI};
 use thiserror::*;
-use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler};
+use wezterm_term::{Clipboard, ClipboardSelection, DownloadHandler, TerminalSize};
 #[cfg(windows)]
 use winapi::um::winsock2::{SOL_SOCKET, SO_RCVBUF, SO_SNDBUF};
 
@@ -941,11 +942,10 @@ impl Mux {
         &self,
         // TODO: disambiguate with TabId
         pane_id: PaneId,
-        direction: SplitDirection,
-        command: Option<CommandBuilder>,
-        command_dir: Option<String>,
+        request: SplitRequest,
+        source: SplitSource,
         domain: config::keyassignment::SpawnTabDomain,
-    ) -> anyhow::Result<(Rc<dyn Pane>, PtySize)> {
+    ) -> anyhow::Result<(Rc<dyn Pane>, TerminalSize)> {
         let (_pane_domain_id, window_id, tab_id) = self
             .resolve_pane_id(pane_id)
             .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
@@ -963,11 +963,18 @@ impl Mux {
             .ok_or_else(|| anyhow!("pane_id {} is invalid", pane_id))?;
         let term_config = current_pane.get_config();
 
-        let cwd = self.resolve_cwd(command_dir, Some(Rc::clone(&current_pane)));
+        let source = match source {
+            SplitSource::Spawn {
+                command,
+                command_dir,
+            } => SplitSource::Spawn {
+                command,
+                command_dir: self.resolve_cwd(command_dir, Some(Rc::clone(&current_pane))),
+            },
+            other => other,
+        };
 
-        let pane = domain
-            .split_pane(command, cwd, tab_id, pane_id, direction)
-            .await?;
+        let pane = domain.split_pane(source, tab_id, pane_id, request).await?;
         if let Some(config) = term_config {
             pane.set_config(config);
         }
@@ -976,14 +983,62 @@ impl Mux {
 
         let dims = pane.get_dimensions();
 
-        let size = PtySize {
-            cols: dims.cols as u16,
-            rows: dims.viewport_rows as u16,
+        let size = TerminalSize {
+            cols: dims.cols,
+            rows: dims.viewport_rows,
             pixel_height: 0, // FIXME: split pane pixel dimensions
             pixel_width: 0,
+            dpi: dims.dpi,
         };
 
         Ok((pane, size))
+    }
+
+    pub async fn move_pane_to_new_tab(
+        &self,
+        pane_id: PaneId,
+        window_id: Option<WindowId>,
+        workspace_for_new_window: Option<String>,
+    ) -> anyhow::Result<(Rc<Tab>, WindowId)> {
+        let (_domain, _src_window, src_tab) = self
+            .resolve_pane_id(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {} not found", pane_id))?;
+        let src_tab = match self.get_tab(src_tab) {
+            Some(t) => t,
+            None => anyhow::bail!("Invalid tab id {}", src_tab),
+        };
+
+        let window_builder;
+        let (window_id, size) = if let Some(window_id) = window_id {
+            let window = self
+                .get_window_mut(window_id)
+                .ok_or_else(|| anyhow!("window_id {} not found on this server", window_id))?;
+            let tab = window
+                .get_active()
+                .ok_or_else(|| anyhow!("window {} has no tabs", window_id))?;
+            let size = tab.get_size();
+
+            (window_id, size)
+        } else {
+            window_builder = self.new_empty_window(workspace_for_new_window);
+            (*window_builder, src_tab.get_size())
+        };
+
+        let pane = src_tab
+            .remove_pane(pane_id)
+            .ok_or_else(|| anyhow::anyhow!("pane {} wasn't in its containing tab!?", pane_id))?;
+
+        let tab = Rc::new(Tab::new(&size));
+        tab.assign_pane(&pane);
+        pane.resize(size)?;
+        self.add_tab_and_active_pane(&tab)?;
+        self.add_tab_to_window(&tab, window_id)?;
+
+        if src_tab.is_dead() {
+            self.remove_tab(src_tab.tab_id());
+        }
+
+        Ok((tab, window_id))
     }
 
     pub async fn spawn_tab_or_window(
@@ -992,7 +1047,7 @@ impl Mux {
         domain: SpawnTabDomain,
         command: Option<CommandBuilder>,
         command_dir: Option<String>,
-        size: PtySize,
+        size: TerminalSize,
         current_pane_id: Option<PaneId>,
         workspace_for_new_window: String,
     ) -> anyhow::Result<(Rc<Tab>, Rc<dyn Pane>, WindowId)> {
@@ -1031,12 +1086,31 @@ impl Mux {
         let cwd = self.resolve_cwd(
             command_dir,
             match current_pane_id {
-                Some(id) => self.get_pane(id),
+                Some(id) => {
+                    // Only use the cwd from the current pane if the domain
+                    // is the same as the one we are spawning into
+                    let (current_domain_id, _, _) = self
+                        .resolve_pane_id(id)
+                        .ok_or_else(|| anyhow!("pane_id {} invalid", id))?;
+                    if current_domain_id == domain.domain_id() {
+                        self.get_pane(id)
+                    } else {
+                        None
+                    }
+                }
                 None => None,
             },
         );
 
-        let tab = domain.spawn(size, command, cwd, window_id).await?;
+        let tab = domain
+            .spawn(size, command.clone(), cwd.clone(), window_id)
+            .await
+            .with_context(|| {
+                format!(
+                    "Spawning in domain `{}`: {size:?} command={command:?} cwd={cwd:?}",
+                    domain.domain_name()
+                )
+            })?;
 
         let pane = tab
             .get_active_pane()
@@ -1082,13 +1156,13 @@ pub enum SessionTerminated {
     WindowClosed,
 }
 
-pub(crate) fn pty_size_to_terminal_size(size: portable_pty::PtySize) -> wezterm_term::TerminalSize {
-    wezterm_term::TerminalSize {
-        physical_rows: size.rows as usize,
-        physical_cols: size.cols as usize,
-        pixel_width: size.pixel_width as usize,
-        pixel_height: size.pixel_height as usize,
-    }
+pub(crate) fn terminal_size_to_pty_size(size: TerminalSize) -> anyhow::Result<PtySize> {
+    Ok(PtySize {
+        rows: size.rows.try_into()?,
+        cols: size.cols.try_into()?,
+        pixel_height: size.pixel_height.try_into()?,
+        pixel_width: size.pixel_width.try_into()?,
+    })
 }
 
 struct MuxClipboard {

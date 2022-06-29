@@ -1,6 +1,6 @@
 # DetachDomain(domain)
 
-*Since: nightly builds only*
+*Since: 20220624-141144-bd1b7c5d*
 
 Attempts to detach the specified domain.  Detaching a domain causes
 it to disconnect and remove its set of windows, tabs and panes from
@@ -12,6 +12,7 @@ error log/debug overlay.
 
 ```lua
 local wezterm = require 'wezterm'
+local act = wezterm.action
 
 return {
   ssh_domains = {
@@ -21,11 +22,11 @@ return {
     }
   },
   keys = {
-    {key="U", mods="CTRL|SHIFT", action=wezterm.action{AttachDomain="devhost"}},
+    {key="U", mods="CTRL|SHIFT", action=act.AttachDomain("devhost")},
     -- Detaches the domain associated with the current pane
-    {key="D", mods="CTRL|SHIFT", action=wezterm.action{DetachDomain="CurrentPaneDomain"}},
+    {key="D", mods="CTRL|SHIFT", action=act.DetachDomain("CurrentPaneDomain")},
     -- Detaches the "devhost" domain
-    {key="E", mods="CTRL|SHIFT", action=wezterm.action{DetachDomain={DomainName="devhost"}}},
+    {key="E", mods="CTRL|SHIFT", action=act.DetachDomain{DomainName="devhost"}},
   },
 }
 

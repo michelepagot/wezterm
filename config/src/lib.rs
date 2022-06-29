@@ -2,17 +2,14 @@
 
 use anyhow::{anyhow, bail, Context, Error};
 use lazy_static::lazy_static;
-use luahelper::impl_lua_conversion;
 use mlua::Lua;
 use ordered_float::NotNan;
-use serde::{Deserialize, Deserializer, Serialize};
 use smol::channel::{Receiver, Sender};
 use smol::prelude::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::fs::DirBuilder;
-use std::marker::PhantomData;
 #[cfg(unix)]
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -20,6 +17,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use wezterm_dynamic::{FromDynamic, FromDynamicOptions, ToDynamic, UnknownFieldAction, Value};
 
 mod background;
 mod bell;
@@ -75,11 +73,43 @@ thread_local! {
     static LUA_CONFIG: RefCell<Option<LuaConfigState>> = RefCell::new(None);
 }
 
+fn toml_table_has_numeric_keys(t: &toml::value::Table) -> bool {
+    t.keys().all(|k| k.parse::<isize>().is_ok())
+}
+
+fn toml_to_dynamic(value: &toml::Value) -> Value {
+    match value {
+        toml::Value::String(s) => s.to_dynamic(),
+        toml::Value::Integer(n) => n.to_dynamic(),
+        toml::Value::Float(n) => n.to_dynamic(),
+        toml::Value::Boolean(b) => b.to_dynamic(),
+        toml::Value::Datetime(d) => d.to_string().to_dynamic(),
+        toml::Value::Array(a) => a
+            .iter()
+            .map(|element| toml_to_dynamic(&element))
+            .collect::<Vec<_>>()
+            .to_dynamic(),
+        // Allow `colors.indexed` to be passed through with actual integer keys
+        toml::Value::Table(t) if toml_table_has_numeric_keys(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (k.parse::<isize>().unwrap().to_dynamic(), toml_to_dynamic(v)))
+                .collect::<BTreeMap<_, _>>()
+                .into(),
+        ),
+        toml::Value::Table(t) => Value::Object(
+            t.iter()
+                .map(|(k, v)| (Value::String(k.to_string()), toml_to_dynamic(v)))
+                .collect::<BTreeMap<_, _>>()
+                .into(),
+        ),
+    }
+}
+
 pub fn build_default_schemes() -> HashMap<String, Palette> {
     let mut color_schemes = HashMap::new();
     for (scheme_name, data) in SCHEMES.iter() {
         let scheme_name = scheme_name.to_string();
-        let scheme: ColorSchemeFile = toml::from_str(data).unwrap();
+        let scheme = ColorSchemeFile::from_toml_str(data).unwrap();
         color_schemes.insert(scheme_name, scheme.colors);
     }
     color_schemes
@@ -236,8 +266,16 @@ fn default_config_with_overrides_applied() -> anyhow::Result<Config> {
     let table = mlua::Value::Table(lua.create_table()?);
     let config = Config::apply_overrides_to(&lua, table)?;
 
-    let cfg: Config = luahelper::from_lua_value(config)
-        .context("Error converting lua value from overrides to Config struct")?;
+    let dyn_config = luahelper::lua_value_to_dynamic(config)?;
+
+    let cfg: Config = Config::from_dynamic(
+        &dyn_config,
+        FromDynamicOptions {
+            unknown_fields: UnknownFieldAction::Deny,
+            deprecated_fields: UnknownFieldAction::Warn,
+        },
+    )
+    .context("Error converting lua value from overrides to Config struct")?;
     // Compute but discard the key bindings here so that we raise any
     // problems earlier than we use them.
     let _ = cfg.key_bindings();
@@ -249,15 +287,16 @@ pub fn common_init(
     config_file: Option<&OsString>,
     overrides: &[(String, String)],
     skip_config: bool,
-) {
+) -> anyhow::Result<()> {
     if let Some(config_file) = config_file {
         set_config_file_override(Path::new(config_file));
     } else if skip_config {
         CONFIG_SKIP.store(true, Ordering::Relaxed);
     }
 
-    set_config_overrides(overrides);
+    set_config_overrides(overrides)?;
     reload();
+    Ok(())
 }
 
 pub fn assign_error_callback(cb: ErrorCallback) {
@@ -301,8 +340,11 @@ pub fn set_config_file_override(path: &Path) {
         .replace(path.to_path_buf());
 }
 
-pub fn set_config_overrides(items: &[(String, String)]) {
+pub fn set_config_overrides(items: &[(String, String)]) -> anyhow::Result<()> {
     *CONFIG_OVERRIDES.lock().unwrap() = items.to_vec();
+
+    let _ = default_config_with_overrides_applied()?;
+    Ok(())
 }
 
 pub fn is_config_overridden() -> bool {
@@ -334,7 +376,7 @@ pub fn configuration() -> ConfigHandle {
 
 /// Returns a version of the config (loaded from the config file)
 /// with some field overridden based on the supplied overrides object.
-pub fn overridden_config(overrides: &serde_json::Value) -> Result<ConfigHandle, Error> {
+pub fn overridden_config(overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
     CONFIG.overridden(overrides)
 }
 
@@ -392,39 +434,43 @@ impl ConfigInner {
         if self.watcher.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
             const DELAY: Duration = Duration::from_millis(200);
-            let watcher = notify::watcher(tx, DELAY).unwrap();
+            let watcher = notify::recommended_watcher(tx).unwrap();
+            let path = path.clone();
+
             std::thread::spawn(move || {
                 // block until we get an event
-                use notify::DebouncedEvent;
+                use notify::EventKind;
 
-                fn extract_path(event: DebouncedEvent) -> Option<PathBuf> {
-                    match event {
-                        // Defer acting until `Write`, otherwise we'll
-                        // reload twice in quick succession
-                        DebouncedEvent::NoticeWrite(_) => None,
-                        DebouncedEvent::Create(path)
-                        | DebouncedEvent::Write(path)
-                        | DebouncedEvent::Chmod(path)
-                        | DebouncedEvent::Remove(path)
-                        | DebouncedEvent::Rename(path, _) => Some(path),
-                        DebouncedEvent::NoticeRemove(path) => {
-                            // In theory, `notify` should deliver DebouncedEvent::Remove
-                            // shortly after this, but it doesn't always do so.
-                            // Let's just wait a bit and report the path changed
-                            // for ourselves.
-                            std::thread::sleep(DELAY);
-                            Some(path)
+                fn extract_path(event: notify::Event) -> Vec<PathBuf> {
+                    match event.kind {
+                        EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_) => {
+                            event.paths
                         }
-                        DebouncedEvent::Error(_, path) => path,
-                        DebouncedEvent::Rescan => None,
+                        _ => vec![],
                     }
                 }
 
                 while let Ok(event) = rx.recv() {
-                    log::trace!("event:{:?}", event);
-                    if let Some(path) = extract_path(event) {
-                        log::debug!("path {} changed, reload config", path.display());
-                        reload();
+                    log::debug!("event:{:?}", event);
+                    match event {
+                        Ok(event) => {
+                            let mut paths = extract_path(event);
+                            if !paths.is_empty() {
+                                // Grace period to allow events to settle
+                                std::thread::sleep(DELAY);
+                                // Drain any other immediately ready events
+                                while let Ok(Ok(event)) = rx.try_recv() {
+                                    paths.append(&mut extract_path(event));
+                                }
+                                paths.sort();
+                                paths.dedup();
+                                log::debug!("paths {:?} changed, reload config", path);
+                                reload();
+                            }
+                        }
+                        Err(_) => {
+                            reload();
+                        }
                     }
                 }
             });
@@ -433,7 +479,7 @@ impl ConfigInner {
         if let Some(watcher) = self.watcher.as_mut() {
             use notify::Watcher;
             watcher
-                .watch(path, notify::RecursiveMode::NonRecursive)
+                .watch(&path, notify::RecursiveMode::NonRecursive)
                 .ok();
         }
     }
@@ -527,7 +573,7 @@ impl ConfigInner {
         self.generation += 1;
     }
 
-    fn overridden(&mut self, overrides: &serde_json::Value) -> Result<ConfigHandle, Error> {
+    fn overridden(&mut self, overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
         let config = Config::load_with_overrides(overrides)?;
         Ok(ConfigHandle {
             config: Arc::new(config.config),
@@ -602,7 +648,7 @@ impl Configuration {
         inner.use_this_config(cfg);
     }
 
-    fn overridden(&self, overrides: &serde_json::Value) -> Result<ConfigHandle, Error> {
+    fn overridden(&self, overrides: &wezterm_dynamic::Value) -> Result<ConfigHandle, Error> {
         let mut inner = self.inner.lock().unwrap();
         inner.overridden(overrides)
     }
@@ -657,104 +703,6 @@ impl std::ops::Deref for ConfigHandle {
     fn deref(&self) -> &Config {
         &*self.config
     }
-}
-
-pub(crate) fn de_notnan<'de, D>(deserializer: D) -> Result<NotNan<f64>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value: f64 = de_number(deserializer)?;
-    NotNan::new(value).map_err(|err| serde::de::Error::custom(err.to_string()))
-}
-
-/// Deserialize either an integer or a float as a float
-pub(crate) fn de_number<'de, D>(deserializer: D) -> Result<f64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    struct Number;
-
-    impl<'de> serde::de::Visitor<'de> for Number {
-        type Value = f64;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("f64 or i64")
-        }
-
-        fn visit_f64<E>(self, value: f64) -> Result<f64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value)
-        }
-
-        fn visit_i64<E>(self, value: i64) -> Result<f64, E>
-        where
-            E: serde::de::Error,
-        {
-            Ok(value as f64)
-        }
-    }
-
-    deserializer.deserialize_any(Number)
-}
-
-/// Helper for deserializing a Vec<T> from lua code.
-/// In lua, `{}` could be either an empty map or an empty vec.
-/// This helper allows an empty map to be specified and treated as an empty vec.
-pub fn de_vec_table<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    struct V<T> {
-        phantom: PhantomData<T>,
-    }
-
-    impl<'de, T> serde::de::Visitor<'de> for V<T>
-    where
-        T: Deserialize<'de>,
-    {
-        type Value = Vec<T>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("Empty table or vector-like table")
-        }
-
-        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::SeqAccess<'de>,
-        {
-            let mut values = if let Some(hint) = seq.size_hint() {
-                Vec::with_capacity(hint)
-            } else {
-                Vec::new()
-            };
-            while let Some(ele) = seq.next_element::<T>()? {
-                values.push(ele);
-            }
-            Ok(values)
-        }
-
-        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where
-            A: serde::de::MapAccess<'de>,
-        {
-            if map.next_entry::<String, T>()?.is_some() {
-                use serde::de::Error;
-                Err(A::Error::custom(
-                    "expected empty table or vector-like table",
-                ))
-            } else {
-                // Empty map is equivalent to empty vec
-                Ok(vec![])
-            }
-        }
-    }
-
-    deserializer.deserialize_any(V {
-        phantom: PhantomData,
-    })
 }
 
 pub struct LoadedConfig {

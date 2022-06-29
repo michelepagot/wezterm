@@ -9,7 +9,7 @@ use crate::{
 };
 use anyhow::{bail, Context};
 use async_trait::async_trait;
-use config::{ConfigHandle, DimensionContext, GeometryOrigin};
+use config::{ConfigHandle, DimensionContext, GeometryOrigin, ImePreeditRendering};
 use lazy_static::lazy_static;
 use promise::Future;
 use raw_window_handle::windows::WindowsHandle;
@@ -49,7 +49,7 @@ use winreg::RegKey;
 
 const GCS_RESULTSTR: DWORD = 0x800;
 const GCS_COMPSTR: DWORD = 0x8;
-const ISC_SHOWUICOMPOSITIONWINDOW: LPARAM = 2147483648;
+const ISC_SHOWUICOMPOSITIONWINDOW: DWORD = 0x80000000;
 
 #[allow(non_snake_case)]
 #[repr(C)]
@@ -212,7 +212,7 @@ impl WindowInner {
             )?)
         })
         .or_else(|err| {
-            log::warn!("EGL init failed {:?}, fall back to WGL", err);
+            log::trace!("EGL init failed {:?}, fall back to WGL", err);
             super::wgl::GlState::create(self.hwnd.0).and_then(|state| unsafe {
                 Ok(glium::backend::Context::new(
                     Rc::new(state),
@@ -267,8 +267,7 @@ impl WindowInner {
         self.last_size.replace(current_dims);
 
         if !same {
-            let imc = ImmContext::get(self.hwnd.0);
-            imc.set_position(Rect::default());
+            self.set_ime_window_position(Rect::default());
 
             self.events.dispatch(WindowEvent::Resized {
                 dimensions: current_dims,
@@ -730,8 +729,15 @@ impl WindowInner {
     }
 
     fn set_text_cursor_position(&mut self, cursor: Rect) {
+        self.set_ime_window_position(cursor);
+    }
+
+    fn set_ime_window_position(&mut self, cursor: Rect) {
         let imc = ImmContext::get(self.hwnd.0);
-        imc.set_position(cursor);
+        match self.config.ime_preedit_rendering {
+            ImePreeditRendering::Builtin => imc.set_candidate_window_position(cursor),
+            ImePreeditRendering::System => imc.set_composition_window_position(cursor),
+        }
     }
 
     fn config_did_change(&mut self, config: &ConfigHandle) {
@@ -1667,7 +1673,7 @@ impl ImmContext {
     }
 
     /// Set the position of the IME candidate window relative to the cursor.
-    pub fn set_position(&self, cursor: Rect) {
+    pub fn set_candidate_window_position(&self, cursor: Rect) {
         let mut cf = CANDIDATEFORM {
             dwIndex: 0,
             // Don't draw the IME candidate window on the cursor
@@ -1688,6 +1694,21 @@ impl ImmContext {
         };
         unsafe {
             ImmSetCandidateWindow(self.imc, &mut cf);
+        }
+    }
+
+    /// Set the position of the IME composition window relative to the cursor.
+    pub fn set_composition_window_position(&self, cursor: Rect) {
+        let mut cf = COMPOSITIONFORM {
+            dwStyle: CFS_POINT,
+            ptCurrentPos: POINT {
+                x: cursor.origin.x.max(0) as i32,
+                y: cursor.origin.y.max(0) as i32,
+            },
+            rcArea: RECT::default(),
+        };
+        unsafe {
+            ImmSetCompositionWindow(self.imc, &mut cf);
         }
     }
 
@@ -1727,8 +1748,15 @@ unsafe fn ime_set_context(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
+    let inner = rc_from_hwnd(hwnd)?;
+    let inner = inner.borrow_mut();
+
+    if inner.config.ime_preedit_rendering == ImePreeditRendering::System {
+        return None;
+    }
+
     // Don't show system CompositionWindow because application itself draws it
-    let lparam = lparam & !ISC_SHOWUICOMPOSITIONWINDOW;
+    let lparam = lparam & !(ISC_SHOWUICOMPOSITIONWINDOW as LPARAM);
     let result = DefWindowProcW(hwnd, msg, wparam, lparam);
     Some(result)
 }
@@ -1742,6 +1770,11 @@ unsafe fn ime_end_composition(
     // IME was cancelled
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
+
+    if inner.config.ime_preedit_rendering == ImePreeditRendering::System {
+        return None;
+    }
+
     inner
         .events
         .dispatch(WindowEvent::AdviseDeadKeyStatus(DeadKeyStatus::None));
@@ -1756,6 +1789,11 @@ unsafe fn ime_composition(
 ) -> Option<LRESULT> {
     let inner = rc_from_hwnd(hwnd)?;
     let mut inner = inner.borrow_mut();
+
+    if inner.config.ime_preedit_rendering == ImePreeditRendering::System {
+        return None;
+    }
+
     let imc = ImmContext::get(hwnd);
 
     let lparam = lparam as DWORD;
@@ -2053,13 +2091,23 @@ impl KeyboardLayoutInfo {
         self.has_alt_gr
     }
 
+    /// Similar to Modifiers::remove_positional_mods except that it preserves
+    /// RIGHT_ALT
+    fn fixup_mods(mods: Modifiers) -> Modifiers {
+        mods - (Modifiers::LEFT_SHIFT
+            | Modifiers::RIGHT_SHIFT
+            | Modifiers::LEFT_CTRL
+            | Modifiers::RIGHT_CTRL
+            | Modifiers::LEFT_ALT)
+    }
+
     pub fn is_dead_key_leader(&mut self, mods: Modifiers, vk: u32) -> Option<char> {
         unsafe {
             self.update();
         }
         if vk <= u8::MAX.into() {
             self.dead_keys
-                .get(&(mods, vk as u8))
+                .get(&(Self::fixup_mods(mods), vk as u8))
                 .map(|dead| dead.dead_char)
         } else {
             None
@@ -2075,8 +2123,15 @@ impl KeyboardLayoutInfo {
             self.update();
         }
         if leader.1 <= u8::MAX.into() && key.1 <= u8::MAX.into() {
-            if let Some(dead) = self.dead_keys.get(&(leader.0, leader.1 as u8)) {
-                if let Some(c) = dead.map.get(&(key.0, key.1 as u8)).map(|&c| c) {
+            if let Some(dead) = self
+                .dead_keys
+                .get(&(Self::fixup_mods(leader.0), leader.1 as u8))
+            {
+                if let Some(c) = dead
+                    .map
+                    .get(&(Self::fixup_mods(key.0), key.1 as u8))
+                    .map(|&c| c)
+                {
                     ResolvedDeadKey::Combined(c)
                 } else {
                     ResolvedDeadKey::InvalidCombination(dead.dead_char)
@@ -2166,6 +2221,19 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
     if keys[VK_SHIFT as usize] & 0x80 != 0 {
         modifiers |= Modifiers::SHIFT;
     }
+    if keys[VK_LSHIFT as usize] & 0x80 != 0 {
+        modifiers |= Modifiers::LEFT_SHIFT;
+    }
+    if keys[VK_RSHIFT as usize] & 0x80 != 0 {
+        modifiers |= Modifiers::RIGHT_SHIFT;
+    }
+    if keys[VK_LCONTROL as usize] & 0x80 != 0 {
+        modifiers |= Modifiers::LEFT_CTRL;
+    }
+    if keys[VK_RCONTROL as usize] & 0x80 != 0 {
+        modifiers |= Modifiers::RIGHT_CTRL;
+    }
+    modifiers.set(Modifiers::ENHANCED_KEY, is_extended);
 
     if inner.keyboard_info.has_alt_gr()
         && (keys[VK_RMENU as usize] & 0x80 != 0)
@@ -2384,12 +2452,7 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
                 );
 
                 match res {
-                    1 => {
-                        // Remove our AltGr placeholder modifier flag now that the
-                        // key press has been expanded.
-                        modifiers.remove(Modifiers::RIGHT_ALT);
-                        Some(KeyCode::Char(std::char::from_u32_unchecked(out[0] as u32)))
-                    }
+                    1 => Some(KeyCode::Char(std::char::from_u32_unchecked(out[0] as u32))),
                     // No mapping, so use our raw info
                     0 => {
                         log::trace!(
@@ -2407,7 +2470,15 @@ unsafe fn key(hwnd: HWND, msg: UINT, wparam: WPARAM, lparam: LPARAM) -> Option<L
                         // as -1 indicates the start of a dead key sequence,
                         // and any other n > 1 indicates an ambiguous expansion.
                         // Either way, indicate that we don't have a valid result.
-                        log::error!("unexpected dead key expansion: {:?}", out);
+                        log::error!(
+                            "unexpected dead key expansion: \
+                             modifiers={:?} vk={:?} res={} releasing={} {:?}",
+                            modifiers,
+                            vk,
+                            res,
+                            releasing,
+                            out
+                        );
                         KeyboardLayoutInfo::clear_key_state();
                         None
                     }

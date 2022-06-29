@@ -3,6 +3,7 @@ use level_stack::{LevelStack, Override};
 use log::trace;
 use std::borrow::Cow;
 use std::ops::Range;
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 
 mod bidi_brackets;
 mod bidi_class;
@@ -14,14 +15,11 @@ use bidi_brackets::BracketType;
 pub use bidi_class::BidiClass;
 pub use direction::Direction;
 pub use level::Level;
-#[cfg(feature = "use_serde")]
-use serde::{Deserialize, Serialize};
 
 /// Placeholder codepoint index that corresponds to NO_LEVEL
 const DELETED: usize = usize::max_value();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, FromDynamic, ToDynamic)]
 pub enum ParagraphDirectionHint {
     LeftToRight,
     RightToLeft,

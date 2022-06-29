@@ -2,9 +2,9 @@
 //! to test the guts of the ssh handling, rather than
 //! to be a full fledged replacement for ssh.
 use anyhow::Context;
+use clap::Parser;
 use portable_pty::{Child, MasterPty, PtySize};
 use std::io::{Read, Write};
-use structopt::StructOpt;
 use termwiz::cell::unicode_column_width;
 use termwiz::lineedit::*;
 use wezterm_ssh::{Config, Session, SessionEvent};
@@ -39,9 +39,9 @@ impl LineEditorHost for PasswordPromptHost {
     }
 }
 
-#[derive(Debug, StructOpt, Default, Clone)]
+#[derive(Debug, Parser, Default, Clone)]
 struct Opt {
-    #[structopt(long = "user", short = "l")]
+    #[clap(long = "user", short = 'l')]
     pub user: Option<String>,
     pub destination: String,
     pub cmd: Vec<String>,
@@ -49,7 +49,7 @@ struct Opt {
 
 fn main() {
     env_logger::init();
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
 
     let mut config = Config::new();
     config.add_default_config_files();

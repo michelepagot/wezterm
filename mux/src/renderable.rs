@@ -1,21 +1,26 @@
-use luahelper::impl_lua_conversion;
+use luahelper::impl_lua_conversion_dynamic;
 use rangeset::RangeSet;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use termwiz::surface::{SequenceNo, SEQ_ZERO};
+use wezterm_dynamic::{FromDynamic, ToDynamic};
 use wezterm_term::{Line, StableRowIndex, Terminal};
 
 /// Describes the location of the cursor
-#[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(
+    Debug, Default, Copy, Clone, Eq, PartialEq, Deserialize, Serialize, FromDynamic, ToDynamic,
+)]
 pub struct StableCursorPosition {
     pub x: usize,
     pub y: StableRowIndex,
     pub shape: termwiz::surface::CursorShape,
     pub visibility: termwiz::surface::CursorVisibility,
 }
-impl_lua_conversion!(StableCursorPosition);
+impl_lua_conversion_dynamic!(StableCursorPosition);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, FromDynamic, ToDynamic,
+)]
 pub struct RenderableDimensions {
     /// The viewport width
     pub cols: usize,
@@ -33,8 +38,9 @@ pub struct RenderableDimensions {
     /// The top of the scrollback (the earliest row we remember)
     /// expressed as a stable index.
     pub scrollback_top: StableRowIndex,
+    pub dpi: u32,
 }
-impl_lua_conversion!(RenderableDimensions);
+impl_lua_conversion_dynamic!(RenderableDimensions);
 
 /// Implements Pane::get_cursor_position for Terminal
 pub fn terminal_get_cursor_position(term: &mut Terminal) -> StableCursorPosition {
@@ -90,5 +96,6 @@ pub fn terminal_get_dimensions(term: &mut Terminal) -> RenderableDimensions {
         scrollback_rows: screen.scrollback_rows(),
         physical_top: screen.visible_row_to_stable_row(0),
         scrollback_top: screen.phys_to_stable_row_index(0),
+        dpi: screen.dpi,
     }
 }

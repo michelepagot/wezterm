@@ -1,4 +1,5 @@
 use super::copy_and_paste::*;
+use super::drag_and_drop::*;
 use crate::os::wayland::connection::WaylandConnection;
 use smithay_client_toolkit as toolkit;
 use std::collections::HashMap;
@@ -22,6 +23,7 @@ use wezterm_input_types::*;
 struct Inner {
     active_surface_id: u32,
     surface_to_pending: HashMap<u32, Arc<Mutex<PendingMouse>>>,
+    drag_and_drop: DragAndDrop,
     serial: u32,
 }
 
@@ -72,10 +74,13 @@ impl Inner {
                     }
                 });
             }
+
             DataDeviceEvent::Enter { .. }
-            | DataDeviceEvent::Leave { .. }
+            | DataDeviceEvent::Leave
             | DataDeviceEvent::Motion { .. }
-            | DataDeviceEvent::Drop => {}
+            | DataDeviceEvent::Drop => {
+                self.drag_and_drop.handle_data_event(event);
+            }
 
             DataDeviceEvent::Selection { id } => {
                 if let Some(offer) = id {
@@ -325,6 +330,9 @@ impl PointerDispatcher {
         inner
             .surface_to_pending
             .insert(surface.as_ref().id(), Arc::clone(pending));
+        if inner.active_surface_id == 0 {
+            inner.active_surface_id = surface.as_ref().id();
+        }
     }
 
     pub fn set_cursor(&self, name: &str, serial: Option<u32>) {

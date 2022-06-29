@@ -5,10 +5,13 @@ use crate::terminalstate::{
 use crate::{ClipboardSelection, Position, TerminalState, VisibleRowIndex, DCS, ST};
 use log::{debug, error};
 use num_traits::FromPrimitive;
+use ordered_float::NotNan;
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use termwiz::cell::{grapheme_column_width, Cell, CellAttributes, SemanticType};
-use termwiz::escape::csi::{CharacterPath, EraseInDisplay};
+use termwiz::escape::csi::{
+    CharacterPath, EraseInDisplay, Keyboard, KittyKeyboardFlags, KittyKeyboardMode,
+};
 use termwiz::escape::osc::{
     ChangeColorPair, ColorOrQuery, FinalTermSemanticPrompt, ITermProprietary,
     ITermUnicodeVersionOp, Selection,
@@ -428,6 +431,60 @@ impl<'a> Performer<'a> {
                     .bidi_hint
                     .replace(ParagraphDirectionHint::RightToLeft);
             }
+            CSI::Keyboard(Keyboard::SetKittyState { flags, mode }) => {
+                if self.config.enable_kitty_keyboard() {
+                    let current_flags = match self.screen().keyboard_stack.last() {
+                        Some(KeyboardEncoding::Kitty(flags)) => *flags,
+                        _ => KittyKeyboardFlags::NONE,
+                    };
+                    let flags = match mode {
+                        KittyKeyboardMode::AssignAll => flags,
+                        KittyKeyboardMode::SetSpecified => current_flags | flags,
+                        KittyKeyboardMode::ClearSpecified => current_flags - flags,
+                    };
+                    self.screen_mut().keyboard_stack.pop();
+                    self.screen_mut()
+                        .keyboard_stack
+                        .push(KeyboardEncoding::Kitty(flags));
+                }
+            }
+            CSI::Keyboard(Keyboard::PushKittyState { flags, mode }) => {
+                if self.config.enable_kitty_keyboard() {
+                    let current_flags = match self.screen().keyboard_stack.last() {
+                        Some(KeyboardEncoding::Kitty(flags)) => *flags,
+                        _ => KittyKeyboardFlags::NONE,
+                    };
+                    let flags = match mode {
+                        KittyKeyboardMode::AssignAll => flags,
+                        KittyKeyboardMode::SetSpecified => current_flags | flags,
+                        KittyKeyboardMode::ClearSpecified => current_flags - flags,
+                    };
+                    let screen = self.screen_mut();
+                    screen.keyboard_stack.push(KeyboardEncoding::Kitty(flags));
+                    if screen.keyboard_stack.len() > 128 {
+                        screen.keyboard_stack.remove(0);
+                    }
+                }
+            }
+            CSI::Keyboard(Keyboard::PopKittyState(n)) => {
+                for _ in 0..n {
+                    self.screen_mut().keyboard_stack.pop();
+                }
+            }
+            CSI::Keyboard(Keyboard::QueryKittySupport) => {
+                if self.config.enable_kitty_keyboard() {
+                    let flags = match self.screen().keyboard_stack.last() {
+                        Some(KeyboardEncoding::Kitty(flags)) => *flags,
+                        _ => KittyKeyboardFlags::NONE,
+                    };
+                    write!(self.writer, "\x1b[?{}u", flags.bits()).ok();
+                    self.writer.flush().ok();
+                }
+            }
+            CSI::Keyboard(Keyboard::ReportKittyState(_)) => {
+                // This is a response to QueryKittySupport and it is invalid for us
+                // to receive it. Just ignore it.
+            }
             CSI::Unspecified(unspec) => {
                 log::warn!("unknown unspecified CSI: {:?}", format!("{}", unspec))
             }
@@ -564,6 +621,7 @@ impl<'a> Performer<'a> {
                 self.suppress_initial_title_change = false;
                 self.accumulating_title.take();
 
+                self.screen.full_reset();
                 self.screen.activate_primary_screen(seqno);
                 self.erase_in_display(EraseInDisplay::EraseScrollback);
                 self.erase_in_display(EraseInDisplay::EraseDisplay);
@@ -586,15 +644,17 @@ impl<'a> Performer<'a> {
                 } else {
                     self.icon_title = Some(title.clone());
                 }
+                let title = self.icon_title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::TitleMaybeChanged);
+                    handler.alert(Alert::IconTitleChanged(title));
                 }
             }
             OperatingSystemCommand::SetIconNameAndWindowTitle(title) => {
                 self.icon_title.take();
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::TitleMaybeChanged);
+                    handler.alert(Alert::WindowTitleChanged(title.clone()));
+                    handler.alert(Alert::IconTitleChanged(Some(title.clone())));
                 }
             }
 
@@ -602,7 +662,7 @@ impl<'a> Performer<'a> {
             | OperatingSystemCommand::SetWindowTitle(title) => {
                 self.title = title.clone();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::TitleMaybeChanged);
+                    handler.alert(Alert::WindowTitleChanged(title.clone()));
                 }
             }
             OperatingSystemCommand::SetHyperlink(link) => {
@@ -630,6 +690,37 @@ impl<'a> Performer<'a> {
                 }
             }
             OperatingSystemCommand::ITermProprietary(iterm) => match iterm {
+                ITermProprietary::RequestCellSize => {
+                    let screen = self.screen();
+                    let height = screen.physical_rows;
+                    let width = screen.physical_cols;
+
+                    let scale = if screen.dpi == 0 {
+                        1.0
+                    } else {
+                        // Since iTerm2 is a macOS specific piece
+                        // of software, it uses the macOS default dpi
+                        // if 72 for the basis of its scale, regardless
+                        // of the host base dpi.
+                        screen.dpi as f32 / 72.
+                    };
+                    let width = (self.pixel_width as f32 / width as f32) / scale;
+                    let height = (self.pixel_height as f32 / height as f32) / scale;
+
+                    let response = OperatingSystemCommand::ITermProprietary(
+                        ITermProprietary::ReportCellSize {
+                            width_pixels: NotNan::new(width).unwrap(),
+                            height_pixels: NotNan::new(height).unwrap(),
+                            scale: if screen.dpi == 0 {
+                                None
+                            } else {
+                                Some(NotNan::new(scale).unwrap())
+                            },
+                        },
+                    );
+                    write!(self.writer, "{}", response).ok();
+                    self.writer.flush().ok();
+                }
                 ITermProprietary::File(image) => self.set_image(*image),
                 ITermProprietary::SetUserVar { name, value } => {
                     self.user_vars.insert(name.clone(), value.clone());
@@ -737,7 +828,7 @@ impl<'a> Performer<'a> {
             OperatingSystemCommand::CurrentWorkingDirectory(url) => {
                 self.current_dir = Url::parse(&url).ok();
                 if let Some(handler) = self.alert_handler.as_mut() {
-                    handler.alert(Alert::TitleMaybeChanged);
+                    handler.alert(Alert::CurrentWorkingDirectoryChanged);
                 }
             }
             OperatingSystemCommand::ChangeColorNumber(specs) => {

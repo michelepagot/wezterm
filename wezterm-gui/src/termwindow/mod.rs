@@ -3,7 +3,7 @@ use super::renderstate::*;
 use super::utilsprites::RenderMetrics;
 use crate::cache::LruCache;
 use crate::colorease::ColorEase;
-use crate::frontend::front_end;
+use crate::frontend::{front_end, try_front_end};
 use crate::glium::texture::SrgbTexture2d;
 use crate::inputmap::InputMap;
 use crate::overlay::{
@@ -17,25 +17,31 @@ use crate::scrollbar::*;
 use crate::selection::Selection;
 use crate::shapecache::*;
 use crate::tabbar::{TabBarItem, TabBarState};
+use crate::termwindow::background::{
+    load_background_image, reload_background_image, LoadedBackgroundLayer,
+};
 use crate::termwindow::keyevent::KeyTableState;
+use crate::termwindow::modal::Modal;
 use ::wezterm_term::input::{ClickPosition, MouseButton as TMB};
 use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
-    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, Pattern, QuickSelectArguments,
-    SpawnCommand,
+    ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment, PaneDirection, Pattern,
+    QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
 };
 use config::{
-    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, GradientOrientation,
-    TermConfig, WindowCloseConfirmation,
+    configuration, AudibleBell, ConfigHandle, Dimension, DimensionContext, TermConfig,
+    WindowCloseConfirmation,
 };
 use mlua::{FromLua, UserData, UserDataFields};
-use mux::pane::{CloseReason, Pane, PaneId};
+use mux::pane::{CloseReason, Pane, PaneId, Pattern as MuxPattern};
 use mux::renderable::RenderableDimensions;
-use mux::tab::{PositionedPane, PositionedSplit, SplitDirection, Tab, TabId};
+use mux::tab::{
+    PositionedPane, PositionedSplit, SplitDirection, SplitRequest, SplitSize as MuxSplitSize, Tab,
+    TabId,
+};
 use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
-use portable_pty::PtySize;
 use smol::channel::Sender;
 use smol::Timer;
 use std::cell::{RefCell, RefMut};
@@ -46,18 +52,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use termwiz::hyperlink::Hyperlink;
-use termwiz::image::{ImageData, ImageDataType};
 use termwiz::surface::SequenceNo;
 use wezterm_font::FontConfiguration;
 use wezterm_gui_subcommands::GuiPosition;
 use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
-use wezterm_term::{Alert, StableRowIndex, TerminalConfiguration};
+use wezterm_term::{Alert, StableRowIndex, TerminalConfiguration, TerminalSize};
 
+pub mod background;
 pub mod box_model;
 pub mod clipboard;
 mod keyevent;
+pub mod modal;
 mod mouseevent;
+pub mod paneselect;
 mod prevcursor;
 mod render;
 pub mod resize;
@@ -112,8 +120,8 @@ pub enum TermWindowNotif {
         name: String,
         again: bool,
     },
-    GetConfigOverrides(Sender<serde_json::Value>),
-    SetConfigOverrides(serde_json::Value),
+    GetConfigOverrides(Sender<wezterm_dynamic::Value>),
+    SetConfigOverrides(wezterm_dynamic::Value),
     CancelOverlayForPane(PaneId),
     CancelOverlayForTab {
         tab_id: TabId,
@@ -187,6 +195,7 @@ pub struct TabInformation {
     pub tab_index: usize,
     pub is_active: bool,
     pub active_pane: Option<PaneInformation>,
+    pub window_id: MuxWindowId,
 }
 
 impl UserData for TabInformation {
@@ -212,6 +221,21 @@ impl UserData for TabInformation {
                     .collect();
             }
             Ok(panes)
+        });
+        fields.add_field_method_get("window_id", |_, this| Ok(this.window_id));
+        fields.add_field_method_get("tab_title", |_, this| {
+            let mux = Mux::get().expect("event to run on main thread");
+            let tab = mux
+                .get_tab(this.tab_id)
+                .ok_or_else(|| mlua::Error::external(format!("tab {} not found", this.tab_id)))?;
+            Ok(tab.get_title())
+        });
+        fields.add_field_method_get("window_title", |_, this| {
+            let mux = Mux::get().expect("event to run on main thread");
+            let window = mux.get_window(this.window_id).ok_or_else(|| {
+                mlua::Error::external(format!("window {} not found", this.window_id))
+            })?;
+            Ok(window.get_title().to_string())
         });
     }
 }
@@ -317,7 +341,7 @@ enum EventState {
 pub struct TermWindow {
     pub window: Option<Window>,
     pub config: ConfigHandle,
-    pub config_overrides: serde_json::Value,
+    pub config_overrides: wezterm_dynamic::Value,
     os_parameters: Option<parameters::Parameters>,
     /// When we most recently received keyboard focus
     focused: Option<Instant>,
@@ -326,7 +350,7 @@ pub struct TermWindow {
     pub dimensions: Dimensions,
     pub window_state: WindowState,
     /// Terminal dimensions
-    terminal_size: PtySize,
+    terminal_size: TerminalSize,
     pub mux_window_id: MuxWindowId,
     pub mux_window_id_for_subscriptions: Arc<Mutex<MuxWindowId>>,
     pub render_metrics: RenderMetrics,
@@ -355,7 +379,7 @@ pub struct TermWindow {
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
 
-    window_background: Option<Arc<ImageData>>,
+    window_background: Vec<LoadedBackgroundLayer>,
 
     current_mouse_buttons: Vec<MousePress>,
     current_mouse_capture: Option<MouseCapture>,
@@ -378,6 +402,8 @@ pub struct TermWindow {
 
     ui_items: Vec<UIItem>,
     dragging: Option<(UIItem, MouseEvent)>,
+
+    modal: RefCell<Option<Rc<dyn Modal>>>,
 
     event_states: HashMap<String, EventState>,
     has_animation: RefCell<Option<Instant>>,
@@ -509,150 +535,6 @@ impl TermWindow {
     }
 }
 
-fn load_background_image(config: &ConfigHandle, dimensions: &Dimensions) -> Option<Arc<ImageData>> {
-    match &config.window_background_gradient {
-        Some(g) => match g.build() {
-            Ok(grad) => {
-                let mut width = dimensions.pixel_width as u32;
-                let mut height = dimensions.pixel_height as u32;
-
-                if matches!(g.orientation, GradientOrientation::Radial { .. }) {
-                    // To simplify the math, we compute a perfect circle
-                    // for the radial gradient, and let the texture sampler
-                    // perturb it to fill the window
-                    width = width.min(height);
-                    height = height.min(width);
-                }
-
-                let mut imgbuf = image::RgbaImage::new(width, height);
-                let fw = width as f64;
-                let fh = height as f64;
-
-                fn to_pixel(c: colorgrad::Color) -> image::Rgba<u8> {
-                    let (r, g, b, a) = c.rgba_u8();
-                    image::Rgba([r, g, b, a])
-                }
-
-                // Map t which is in range [a, b] to range [c, d]
-                fn remap(t: f64, a: f64, b: f64, c: f64, d: f64) -> f64 {
-                    (t - a) * ((d - c) / (b - a)) + c
-                }
-
-                let (dmin, dmax) = grad.domain();
-
-                let rng = fastrand::Rng::new();
-
-                // We add some randomness to the position that we use to
-                // index into the color gradient, so that we can avoid
-                // visible color banding.  The default 64 was selected
-                // because it it was the smallest value on my mac where
-                // the banding wasn't obvious.
-                let noise_amount = g.noise.unwrap_or_else(|| {
-                    if matches!(g.orientation, GradientOrientation::Radial { .. }) {
-                        16
-                    } else {
-                        64
-                    }
-                });
-
-                fn noise(rng: &fastrand::Rng, noise_amount: usize) -> f64 {
-                    if noise_amount == 0 {
-                        0.
-                    } else {
-                        rng.usize(0..noise_amount) as f64 * -1.
-                    }
-                }
-
-                match g.orientation {
-                    GradientOrientation::Horizontal => {
-                        for (x, _, pixel) in imgbuf.enumerate_pixels_mut() {
-                            *pixel = to_pixel(grad.at(remap(
-                                x as f64 + noise(&rng, noise_amount),
-                                0.0,
-                                fw,
-                                dmin,
-                                dmax,
-                            )));
-                        }
-                    }
-                    GradientOrientation::Vertical => {
-                        for (_, y, pixel) in imgbuf.enumerate_pixels_mut() {
-                            *pixel = to_pixel(grad.at(remap(
-                                y as f64 + noise(&rng, noise_amount),
-                                0.0,
-                                fh,
-                                dmin,
-                                dmax,
-                            )));
-                        }
-                    }
-                    GradientOrientation::Radial { radius, cx, cy } => {
-                        let radius = fw * radius.unwrap_or(0.5);
-                        let cx = fw * cx.unwrap_or(0.5);
-                        let cy = fh * cy.unwrap_or(0.5);
-
-                        for (x, y, pixel) in imgbuf.enumerate_pixels_mut() {
-                            let nx = noise(&rng, noise_amount);
-                            let ny = noise(&rng, noise_amount);
-
-                            let t = (nx + (x as f64 - cx).powi(2) + (ny + y as f64 - cy).powi(2))
-                                .sqrt()
-                                / radius;
-                            *pixel = to_pixel(grad.at(t));
-                        }
-                    }
-                }
-
-                let data = imgbuf.into_vec();
-                return Some(Arc::new(ImageData::with_data(
-                    ImageDataType::new_single_frame(width, height, data),
-                )));
-            }
-            Err(err) => {
-                log::error!(
-                    "window_background_gradient: error building gradient: {:#} {:?}",
-                    err,
-                    g
-                );
-                return None;
-            }
-        },
-        None => {}
-    }
-    match &config.window_background_image {
-        Some(p) => match std::fs::read(p) {
-            Ok(data) => {
-                log::info!("loaded {}", p.display());
-                let data = ImageDataType::EncodedFile(data).decode();
-                Some(Arc::new(ImageData::with_data(data)))
-            }
-            Err(err) => {
-                log::error!(
-                    "Failed to load window_background_image {}: {}",
-                    p.display(),
-                    err
-                );
-                None
-            }
-        },
-        None => None,
-    }
-}
-
-fn reload_background_image(
-    config: &ConfigHandle,
-    image: &Option<Arc<ImageData>>,
-    dimensions: &Dimensions,
-) -> Option<Arc<ImageData>> {
-    let data = load_background_image(config, dimensions)?;
-    match image {
-        Some(existing) if existing.hash() == data.data().compute_hash() => {
-            Some(Arc::clone(existing))
-        }
-        _ => Some(data),
-    }
-}
-
 impl TermWindow {
     pub async fn new_window(mux_window_id: MuxWindowId) -> anyhow::Result<()> {
         let config = configuration();
@@ -682,11 +564,12 @@ impl TermWindow {
             0
         };
 
-        let terminal_size = PtySize {
-            rows: physical_rows as u16,
-            cols: physical_cols as u16,
-            pixel_width: (render_metrics.cell_size.width as usize * physical_cols) as u16,
-            pixel_height: (render_metrics.cell_size.height as usize * physical_rows) as u16,
+        let terminal_size = TerminalSize {
+            rows: physical_rows,
+            cols: physical_cols,
+            pixel_width: (render_metrics.cell_size.width as usize * physical_cols),
+            pixel_height: (render_metrics.cell_size.height as usize * physical_rows),
+            dpi: dpi as u32,
         };
 
         if terminal_size != size {
@@ -711,26 +594,26 @@ impl TermWindow {
             pixel_max: terminal_size.pixel_width as f32,
             pixel_cell: render_metrics.cell_size.width as f32,
         };
-        let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as u16;
-        let padding_right = resize::effective_right_padding(&config, h_context);
+        let padding_left = config.window_padding.left.evaluate_as_pixels(h_context) as usize;
+        let padding_right = resize::effective_right_padding(&config, h_context) as usize;
         let v_context = DimensionContext {
             dpi: dpi as f32,
             pixel_max: terminal_size.pixel_height as f32,
             pixel_cell: render_metrics.cell_size.height as f32,
         };
-        let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as u16;
-        let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as u16;
+        let padding_top = config.window_padding.top.evaluate_as_pixels(v_context) as usize;
+        let padding_bottom = config.window_padding.bottom.evaluate_as_pixels(v_context) as usize;
 
         let dimensions = Dimensions {
             pixel_width: (terminal_size.pixel_width + padding_left + padding_right) as usize,
-            pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as u16)
+            pixel_height: ((terminal_size.rows * render_metrics.cell_size.height as usize)
                 + padding_top
                 + padding_bottom) as usize
                 + tab_bar_height,
             dpi,
         };
 
-        let window_background = load_background_image(&config, &dimensions);
+        let window_background = load_background_image(&config, &dimensions, &render_metrics);
 
         log::trace!(
             "TermWindow::new_window called with mux_window_id {} {:?} {:?}",
@@ -748,7 +631,7 @@ impl TermWindow {
             window: None,
             window_background,
             config: config.clone(),
-            config_overrides: serde_json::Value::default(),
+            config_overrides: wezterm_dynamic::Value::default(),
             palette: None,
             focused: None,
             mux_window_id,
@@ -815,6 +698,7 @@ impl TermWindow {
             last_ui_item: None,
             is_click_to_focus_window: false,
             key_table_state: KeyTableState::default(),
+            modal: RefCell::new(None),
         };
 
         let tw = Rc::new(RefCell::new(myself));
@@ -884,6 +768,7 @@ impl TermWindow {
 
         crate::update::start_update_checker();
         front_end().record_known_window(window, mux_window_id);
+
         Ok(())
     }
 
@@ -1002,6 +887,7 @@ impl TermWindow {
         match notif {
             TermWindowNotif::InvalidateShapeCache => {
                 self.shape_cache.borrow_mut().clear();
+                self.invalidate_modal();
                 window.invalidate();
             }
             TermWindowNotif::PerformAssignment {
@@ -1058,7 +944,10 @@ impl TermWindow {
                 MuxNotification::Alert {
                     alert:
                         Alert::OutputSinceFocusLost
-                        | Alert::TitleMaybeChanged
+                        | Alert::CurrentWorkingDirectoryChanged
+                        | Alert::WindowTitleChanged(_)
+                        | Alert::TabTitleChanged(_)
+                        | Alert::IconTitleChanged(_)
                         | Alert::SetUserVar { .. },
                     ..
                 } => {
@@ -1137,6 +1026,7 @@ impl TermWindow {
                 self.tab_state.borrow_mut().clear();
                 self.current_highlight.take();
                 self.invalidate_fancy_tab_bar();
+                self.invalidate_modal();
 
                 let mux = Mux::get().expect("to be main thread with mux running");
                 if let Some(window) = mux.get_window(self.mux_window_id) {
@@ -1213,7 +1103,13 @@ impl TermWindow {
         match n {
             MuxNotification::Alert {
                 pane_id,
-                alert: Alert::OutputSinceFocusLost | Alert::TitleMaybeChanged | Alert::Bell,
+                alert:
+                    Alert::OutputSinceFocusLost
+                    | Alert::CurrentWorkingDirectoryChanged
+                    | Alert::WindowTitleChanged(_)
+                    | Alert::TabTitleChanged(_)
+                    | Alert::IconTitleChanged(_)
+                    | Alert::Bell,
             }
             | MuxNotification::PaneOutput(pane_id) => {
                 // Ideally we'd check to see if pane_id is part of this window,
@@ -1461,8 +1357,12 @@ impl TermWindow {
         self.config = config.clone();
         self.palette.take();
 
-        self.window_background =
-            reload_background_image(&config, &self.window_background, &self.dimensions);
+        self.window_background = reload_background_image(
+            &config,
+            &self.window_background,
+            &self.dimensions,
+            &self.render_metrics,
+        );
 
         let mux = Mux::get().unwrap();
         let window = match mux.get_window(self.mux_window_id) {
@@ -1500,6 +1400,7 @@ impl TermWindow {
         self.shape_cache.borrow_mut().clear();
         self.fancy_tab_bar.take();
         self.invalidate_fancy_tab_bar();
+        self.invalidate_modal();
         self.input_map = InputMap::new(&config);
         self.leader_is_down = None;
         let dimensions = self.dimensions;
@@ -1526,7 +1427,25 @@ impl TermWindow {
             window.invalidate();
         }
 
+        self.invalidate_modal();
         self.emit_window_event("window-config-reloaded", None);
+    }
+
+    fn invalidate_modal(&mut self) {
+        if let Some(modal) = self.get_modal() {
+            modal.reconfigure(self);
+        }
+    }
+
+    pub fn cancel_modal(&self) {
+        self.modal.borrow_mut().take();
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
+    }
+
+    fn get_modal(&self) -> Option<Rc<dyn Modal>> {
+        self.modal.borrow().as_ref().map(|m| Rc::clone(&m))
     }
 
     fn update_scrollbar(&mut self) {
@@ -1627,6 +1546,7 @@ impl TermWindow {
         if new_tab_bar != self.tab_bar {
             self.tab_bar = new_tab_bar;
             self.invalidate_fancy_tab_bar();
+            self.invalidate_modal();
             if let Some(window) = self.window.as_ref() {
                 window.invalidate();
             }
@@ -1730,11 +1650,11 @@ impl TermWindow {
         }
     }
 
-    fn update_text_cursor(&mut self, pane: &Rc<dyn Pane>) {
-        let cursor = pane.get_cursor_position();
+    fn update_text_cursor(&mut self, pos: &PositionedPane) {
         if let Some(win) = self.window.as_ref() {
-            let top = pane.get_dimensions().physical_top;
-            let tab_bar_height = if self.show_tab_bar {
+            let cursor = pos.pane.get_cursor_position();
+            let top = pos.pane.get_dimensions().physical_top;
+            let tab_bar_height = if self.show_tab_bar && !self.config.tab_bar_at_bottom {
                 self.tab_bar_pixel_height().unwrap()
             } else {
                 0.0
@@ -1743,9 +1663,10 @@ impl TermWindow {
 
             let r = Rect::new(
                 Point::new(
-                    (cursor.x.max(0) as isize * self.render_metrics.cell_size.width)
+                    (((cursor.x + pos.left) as isize).max(0) * self.render_metrics.cell_size.width)
                         .add(padding_left as isize),
-                    ((cursor.y - top).max(0) as isize * self.render_metrics.cell_size.height)
+                    ((cursor.y + pos.top as isize - top).max(0)
+                        * self.render_metrics.cell_size.height)
                         .add(tab_bar_height as isize)
                         .add(padding_top as isize),
                 ),
@@ -2039,6 +1960,12 @@ impl TermWindow {
     ) -> anyhow::Result<()> {
         use KeyAssignment::*;
 
+        if let Some(modal) = self.get_modal() {
+            if modal.perform_assignment(assignment, self) {
+                return Ok(());
+            }
+        }
+
         if pane.perform_assignment(assignment) {
             return Ok(());
         }
@@ -2092,11 +2019,27 @@ impl TermWindow {
             }
             SplitHorizontal(spawn) => {
                 log::trace!("SplitHorizontal {:?}", spawn);
-                self.spawn_command(spawn, SpawnWhere::SplitPane(SplitDirection::Horizontal));
+                self.spawn_command(
+                    spawn,
+                    SpawnWhere::SplitPane(SplitRequest {
+                        direction: SplitDirection::Horizontal,
+                        target_is_second: true,
+                        size: MuxSplitSize::Percent(50),
+                        top_level: false,
+                    }),
+                );
             }
             SplitVertical(spawn) => {
                 log::trace!("SplitVertical {:?}", spawn);
-                self.spawn_command(spawn, SpawnWhere::SplitPane(SplitDirection::Vertical));
+                self.spawn_command(
+                    spawn,
+                    SpawnWhere::SplitPane(SplitRequest {
+                        direction: SplitDirection::Vertical,
+                        target_is_second: true,
+                        size: MuxSplitSize::Percent(50),
+                        top_level: false,
+                    }),
+                );
             }
             ToggleFullScreen => {
                 self.window.as_ref().unwrap().toggle_fullscreen();
@@ -2262,7 +2205,7 @@ impl TermWindow {
                         let mut params = existing.get_params();
                         params.editing_search = true;
                         if !pattern.is_empty() {
-                            params.pattern = pattern.clone();
+                            params.pattern = self.resolve_search_pattern(pattern.clone(), &pane);
                         }
                         existing.apply_params(params);
                         replace_current = true;
@@ -2271,7 +2214,7 @@ impl TermWindow {
                             self,
                             &pane,
                             CopyModeParams {
-                                pattern: pattern.clone(),
+                                pattern: self.resolve_search_pattern(pattern.clone(), &pane),
                                 editing_search: true,
                             },
                         );
@@ -2319,7 +2262,7 @@ impl TermWindow {
                             self,
                             &pane,
                             CopyModeParams {
-                                pattern: Pattern::default(),
+                                pattern: MuxPattern::default(),
                                 editing_search: false,
                             },
                         );
@@ -2449,6 +2392,7 @@ impl TermWindow {
             AttachDomain(domain) => {
                 let window = self.mux_window_id;
                 let domain = domain.to_string();
+                let dpi = self.dimensions.dpi as u32;
 
                 promise::spawn::spawn(async move {
                     let mux = Mux::get().unwrap();
@@ -2465,7 +2409,7 @@ impl TermWindow {
                     if !have_panes_in_domain {
                         let config = config::configuration();
                         let _tab = domain
-                            .spawn(config.initial_size(), None, None, window)
+                            .spawn(config.initial_size(dpi), None, None, window)
                             .await?;
                     }
 
@@ -2475,6 +2419,52 @@ impl TermWindow {
             }
             CopyMode(_) => {
                 // NOP here; handled by the overlay directly
+            }
+            RotatePanes(direction) => {
+                let mux = Mux::get().unwrap();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(()),
+                };
+                match direction {
+                    RotationDirection::Clockwise => tab.rotate_clockwise(),
+                    RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
+                }
+            }
+            SplitPane(split) => {
+                log::trace!("SplitPane {:?}", split);
+                self.spawn_command(
+                    &split.command,
+                    SpawnWhere::SplitPane(SplitRequest {
+                        direction: match split.direction {
+                            PaneDirection::Down | PaneDirection::Up => SplitDirection::Vertical,
+                            PaneDirection::Left | PaneDirection::Right => {
+                                SplitDirection::Horizontal
+                            }
+                            PaneDirection::Next | PaneDirection::Prev => {
+                                log::error!(
+                                    "Invalid direction {:?} for SplitPane",
+                                    split.direction
+                                );
+                                return Ok(());
+                            }
+                        },
+                        target_is_second: match split.direction {
+                            PaneDirection::Down | PaneDirection::Right => true,
+                            PaneDirection::Up | PaneDirection::Left => false,
+                            PaneDirection::Next | PaneDirection::Prev => unreachable!(),
+                        },
+                        size: match split.size {
+                            SplitSize::Percent(n) => MuxSplitSize::Percent(n),
+                            SplitSize::Cells(n) => MuxSplitSize::Cells(n),
+                        },
+                        top_level: split.top_level,
+                    }),
+                );
+            }
+            PaneSelect(args) => {
+                let modal = crate::termwindow::paneselect::PaneSelector::new(self, args);
+                self.modal.borrow_mut().replace(Rc::new(modal));
             }
         };
         Ok(())
@@ -2512,7 +2502,9 @@ impl TermWindow {
                 };
                 if default_click {
                     log::info!("clicking {}", link);
-                    open::that_in_background(&link);
+                    if let Err(err) = open::that(&link) {
+                        log::error!("Error opening {}: {:#}", link, err);
+                    }
                 }
                 Ok(())
             }
@@ -2766,6 +2758,7 @@ impl TermWindow {
                     tab_index: idx,
                     tab_id: tab.tab_id(),
                     is_active: tab_index == idx,
+                    window_id: self.mux_window_id,
                     active_pane: panes
                         .iter()
                         .find(|p| p.is_active)
@@ -2886,12 +2879,31 @@ impl TermWindow {
         });
         self.update_title();
     }
+
+    fn resolve_search_pattern(&self, pattern: Pattern, pane: &Rc<dyn Pane>) -> MuxPattern {
+        match pattern {
+            Pattern::CaseSensitiveString(s) => MuxPattern::CaseSensitiveString(s),
+            Pattern::CaseInSensitiveString(s) => MuxPattern::CaseInSensitiveString(s),
+            Pattern::Regex(s) => MuxPattern::Regex(s),
+            Pattern::CurrentSelectionOrEmptyString => {
+                let text = self.selection_text(pane);
+                let first_line = text
+                    .lines()
+                    .next()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                MuxPattern::CaseSensitiveString(first_line)
+            }
+        }
+    }
 }
 
 impl Drop for TermWindow {
     fn drop(&mut self) {
         if let Some(window) = self.window.take() {
-            front_end().forget_known_window(&window);
+            if let Some(fe) = try_front_end() {
+                fe.forget_known_window(&window);
+            }
         }
     }
 }

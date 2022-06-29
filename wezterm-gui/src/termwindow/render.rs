@@ -43,7 +43,7 @@ use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::bitmaps::Texture2d;
 use window::color::LinearRgba;
 
-const TOP_LEFT_ROUNDED_CORNER: &[Poly] = &[Poly {
+pub const TOP_LEFT_ROUNDED_CORNER: &[Poly] = &[Poly {
     path: &[
         PolyCommand::MoveTo(BlockCoord::One, BlockCoord::One),
         PolyCommand::LineTo(BlockCoord::One, BlockCoord::Zero),
@@ -57,13 +57,41 @@ const TOP_LEFT_ROUNDED_CORNER: &[Poly] = &[Poly {
     style: PolyStyle::Fill,
 }];
 
-const TOP_RIGHT_ROUNDED_CORNER: &[Poly] = &[Poly {
+pub const BOTTOM_LEFT_ROUNDED_CORNER: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::One, BlockCoord::Zero),
+        PolyCommand::LineTo(BlockCoord::One, BlockCoord::One),
+        PolyCommand::QuadTo {
+            control: (BlockCoord::Zero, BlockCoord::One),
+            to: (BlockCoord::Zero, BlockCoord::Zero),
+        },
+        PolyCommand::Close,
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Fill,
+}];
+
+pub const TOP_RIGHT_ROUNDED_CORNER: &[Poly] = &[Poly {
     path: &[
         PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::One),
         PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::Zero),
         PolyCommand::QuadTo {
             control: (BlockCoord::One, BlockCoord::Zero),
             to: (BlockCoord::One, BlockCoord::One),
+        },
+        PolyCommand::Close,
+    ],
+    intensity: BlockAlpha::Full,
+    style: PolyStyle::Fill,
+}];
+
+pub const BOTTOM_RIGHT_ROUNDED_CORNER: &[Poly] = &[Poly {
+    path: &[
+        PolyCommand::MoveTo(BlockCoord::Zero, BlockCoord::Zero),
+        PolyCommand::LineTo(BlockCoord::Zero, BlockCoord::One),
+        PolyCommand::QuadTo {
+            control: (BlockCoord::One, BlockCoord::One),
+            to: (BlockCoord::One, BlockCoord::Zero),
         },
         PolyCommand::Close,
     ],
@@ -174,8 +202,14 @@ pub struct ComputeCellFgBgParams<'a> {
 #[derive(Debug)]
 pub struct ComputeCellFgBgResult {
     pub fg_color: LinearRgba,
+    pub fg_color_alt: LinearRgba,
     pub bg_color: LinearRgba,
+    pub bg_color_alt: LinearRgba,
+    pub fg_color_mix: f32,
+    pub bg_color_mix: f32,
     pub cursor_border_color: LinearRgba,
+    pub cursor_border_color_alt: LinearRgba,
+    pub cursor_border_mix: f32,
     pub cursor_shape: Option<CursorShape>,
 }
 
@@ -214,39 +248,19 @@ impl super::TermWindow {
 
         'pass: for pass in 0.. {
             match self.paint_opengl_pass() {
-                Ok(_) => {
-                    let mut allocated = false;
-                    for vb_idx in 0..3 {
-                        if let Some(need_quads) =
-                            self.render_state.as_mut().unwrap().vb[vb_idx].need_more_quads()
-                        {
-                            self.invalidate_fancy_tab_bar();
-
-                            // Round up to next multiple of 1024 that is >=
-                            // the number of needed quads for this frame
-                            let num_quads = (need_quads + 1023) & !1023;
-                            if let Err(err) = self
-                                .render_state
-                                .as_mut()
-                                .unwrap()
-                                .reallocate_quads(vb_idx, num_quads)
-                            {
-                                log::error!(
-                                    "Failed to allocate {} quads (needed {}): {:#}",
-                                    num_quads,
-                                    need_quads,
-                                    err
-                                );
-                                break 'pass;
-                            }
-                            log::trace!("Allocated {} quads (needed {})", num_quads, need_quads);
-                            allocated = true;
+                Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
+                    Ok(allocated) => {
+                        if !allocated {
+                            break 'pass;
                         }
+                        self.invalidate_fancy_tab_bar();
+                        self.invalidate_modal();
                     }
-                    if !allocated {
+                    Err(err) => {
+                        log::error!("{:#}", err);
                         break 'pass;
                     }
-                }
+                },
                 Err(err) => {
                     if let Some(&OutOfTextureSpace {
                         size: Some(size),
@@ -263,6 +277,7 @@ impl super::TermWindow {
                             self.recreate_texture_atlas(Some(size))
                         };
                         self.invalidate_fancy_tab_bar();
+                        self.invalidate_modal();
 
                         if let Err(err) = result {
                             if self.allow_images {
@@ -283,6 +298,7 @@ impl super::TermWindow {
                         }
                     } else if err.root_cause().downcast_ref::<ClearShapeCache>().is_some() {
                         self.invalidate_fancy_tab_bar();
+                        self.invalidate_modal();
                         self.shape_cache.borrow_mut().clear();
                     } else {
                         log::error!("paint_opengl_pass failed: {:#}", err);
@@ -768,11 +784,11 @@ impl super::TermWindow {
                 right: Dimension::Cells(0.),
                 top: Dimension::Cells(0.),
                 bottom: Dimension::Cells(0.),
-            });
+            })
+            .zindex(1);
         let right_ele = Element::new(&font, ElementContent::Children(right_eles))
             .colors(bar_colors.clone())
-            .float(Float::Right)
-            .zindex(-1);
+            .float(Float::Right);
 
         let content = ElementContent::Children(vec![left_ele, right_ele]);
 
@@ -804,6 +820,7 @@ impl super::TermWindow {
                 ),
                 metrics: &metrics,
                 gl_state: self.render_state.as_ref().unwrap(),
+                zindex: 10,
             },
             &tabs,
         )?;
@@ -821,6 +838,21 @@ impl super::TermWindow {
         Ok(computed)
     }
 
+    fn paint_modal(&mut self) -> anyhow::Result<()> {
+        if let Some(modal) = self.get_modal() {
+            for computed in modal.computed_element(self)?.iter() {
+                let mut ui_items = computed.ui_items();
+
+                let gl_state = self.render_state.as_ref().unwrap();
+                self.render_element(&computed, gl_state, None)?;
+
+                self.ui_items.append(&mut ui_items);
+            }
+        }
+
+        Ok(())
+    }
+
     fn paint_fancy_tab_bar(&self) -> anyhow::Result<Vec<UIItem>> {
         let computed = self
             .fancy_tab_bar
@@ -829,10 +861,7 @@ impl super::TermWindow {
         let ui_items = computed.ui_items();
 
         let gl_state = self.render_state.as_ref().unwrap();
-        let vb = &gl_state.vb[1];
-        let mut vb_mut = vb.current_vb_mut();
-        let mut layer1 = vb.map(&mut vb_mut);
-        self.render_element(&computed, &mut layer1, None)?;
+        self.render_element(&computed, gl_state, None)?;
 
         Ok(ui_items)
     }
@@ -875,7 +904,7 @@ impl super::TermWindow {
         ));
 
         let window_is_transparent =
-            self.window_background.is_some() || self.config.window_background_opacity != 1.0;
+            !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
         let gl_state = self.render_state.as_ref().unwrap();
         let white_space = gl_state.util_sprites.white_space.texture_coords();
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
@@ -888,7 +917,9 @@ impl super::TermWindow {
                 self.config.text_background_opacity
             });
 
-        let vb = [&gl_state.vb[0], &gl_state.vb[1], &gl_state.vb[2]];
+        let layer = gl_state.layer_for_zindex(0)?;
+        let vbs = layer.vb.borrow();
+        let vb = [&vbs[0], &vbs[1], &vbs[2]];
         let mut vb_mut0 = vb[0].current_vb_mut();
         let mut vb_mut1 = vb[1].current_vb_mut();
         let mut vb_mut2 = vb[2].current_vb_mut();
@@ -914,6 +945,7 @@ impl super::TermWindow {
                     scrollback_rows: 0,
                     scrollback_top: 0,
                     viewport_rows: 1,
+                    dpi: self.terminal_size.dpi,
                 },
                 config: &self.config,
                 cursor_border_color: LinearRgba::default(),
@@ -944,7 +976,8 @@ impl super::TermWindow {
         if let Some(ref os_params) = self.os_parameters {
             if let Some(ref border_dimensions) = os_params.border_dimensions {
                 let gl_state = self.render_state.as_ref().unwrap();
-                let vb = &gl_state.vb[1];
+                let layer = gl_state.layer_for_zindex(0)?;
+                let vb = &layer.vb.borrow()[2];
                 let mut vb_mut = vb.current_vb_mut();
                 let mut layer1 = vb.map(&mut vb_mut);
 
@@ -992,6 +1025,16 @@ impl super::TermWindow {
         Ok(())
     }
 
+    pub fn min_scroll_bar_height(&self) -> f32 {
+        self.config
+            .min_scroll_bar_height
+            .evaluate_as_pixels(DimensionContext {
+                dpi: self.dimensions.dpi as f32,
+                pixel_max: self.terminal_size.pixel_height as f32,
+                pixel_cell: self.render_metrics.cell_size.height as f32,
+            })
+    }
+
     pub fn paint_pane_opengl(
         &mut self,
         pos: &PositionedPane,
@@ -1014,7 +1057,6 @@ impl super::TermWindow {
         };
         */
 
-        let global_bg_color = self.palette().background;
         let global_cursor_fg = self.palette().cursor_fg;
         let global_cursor_bg = self.palette().cursor_bg;
         let config = &self.config;
@@ -1065,7 +1107,9 @@ impl super::TermWindow {
         }
 
         let gl_state = self.render_state.as_ref().unwrap();
-        let vb = [&gl_state.vb[0], &gl_state.vb[1], &gl_state.vb[2]];
+        let layer = gl_state.layer_for_zindex(0)?;
+        let vbs = layer.vb.borrow();
+        let vb = [&vbs[0], &vbs[1], &vbs[2]];
 
         let start = Instant::now();
         let mut vb_mut0 = vb[0].current_vb_mut();
@@ -1085,7 +1129,7 @@ impl super::TermWindow {
         let filled_box = gl_state.util_sprites.filled_box.texture_coords();
 
         let window_is_transparent =
-            self.window_background.is_some() || config.window_background_opacity != 1.0;
+            !self.window_background.is_empty() || config.window_background_opacity != 1.0;
 
         let default_bg = palette
             .resolve_bg(ColorAttribute::Default)
@@ -1096,62 +1140,7 @@ impl super::TermWindow {
                 config.text_background_opacity
             });
 
-        // Render the full window background
-        if pos.index == 0 {
-            match (self.window_background.as_ref(), self.allow_images) {
-                (Some(im), true) => {
-                    // Render the window background image
-                    let color = palette
-                        .background
-                        .to_linear()
-                        .mul_alpha(config.window_background_opacity);
-
-                    let (sprite, next_due) =
-                        gl_state.glyph_cache.borrow_mut().cached_image(im, None)?;
-                    self.update_next_frame_time(next_due);
-                    let mut quad = layers[0].allocate()?;
-                    quad.set_position(
-                        self.dimensions.pixel_width as f32 / -2.,
-                        self.dimensions.pixel_height as f32 / -2.,
-                        self.dimensions.pixel_width as f32 / 2.,
-                        self.dimensions.pixel_height as f32 / 2.,
-                    );
-                    quad.set_texture(sprite.texture_coords());
-                    quad.set_is_background_image();
-                    quad.set_hsv(config.window_background_image_hsb);
-                    quad.set_fg_color(color);
-                }
-                _ if window_is_transparent && num_panes > 1 => {
-                    // Avoid doubling up the background color: the panes
-                    // will render out through the padding so there
-                    // should be no gaps that need filling in
-                }
-                _ => {
-                    // Regular window background color
-                    let background = if num_panes == 1 {
-                        // If we're the only pane, use the pane's palette
-                        // to draw the padding background
-                        palette.background
-                    } else {
-                        global_bg_color
-                    }
-                    .to_linear()
-                    .mul_alpha(config.window_background_opacity);
-                    self.filled_rectangle(
-                        &mut layers[0],
-                        euclid::rect(
-                            0.,
-                            0.,
-                            self.dimensions.pixel_width as f32,
-                            self.dimensions.pixel_height as f32,
-                        ),
-                        background,
-                    )?;
-                }
-            }
-        }
-
-        if num_panes > 1 && self.window_background.is_none() {
+        if num_panes > 1 && self.window_background.is_empty() {
             // Per-pane, palette-specified background
             let cell_width = self.render_metrics.cell_size.width as f32;
             let cell_height = self.render_metrics.cell_size.height as f32;
@@ -1293,13 +1282,15 @@ impl super::TermWindow {
         if pos.is_active && self.show_scroll_bar {
             let thumb_y_offset = top_bar_height as usize + border.top.get();
 
+            let min_height = self.min_scroll_bar_height();
+
             let info = ScrollHit::thumb(
                 &*pos.pane,
                 current_viewport,
                 self.dimensions.pixel_height.saturating_sub(
                     thumb_y_offset + border.bottom.get() + bottom_bar_height as usize,
                 ),
-                (self.render_metrics.cell_size.height as f32 / 2.0) as usize,
+                min_height as usize,
             );
             let abs_thumb_top = thumb_y_offset + info.top;
             let thumb_size = info.height;
@@ -1420,7 +1411,7 @@ impl super::TermWindow {
         Ok(())
     }
 
-    pub fn call_draw(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
+    fn call_draw(&mut self, frame: &mut glium::Frame) -> anyhow::Result<()> {
         let gl_state = self.render_state.as_ref().unwrap();
         let tex = gl_state.glyph_cache.borrow().atlas.texture();
         let projection = euclid::Transform3D::<f32, f32, f32>::ortho(
@@ -1484,33 +1475,35 @@ impl super::TermWindow {
             foreground_text_hsb.brightness,
         );
 
-        for idx in 0..3 {
-            let vb = &gl_state.vb[idx];
-            let (vertex_count, index_count) = vb.vertex_index_count();
-            if vertex_count > 0 {
-                let vertices = vb.current_vb();
-                let subpixel_aa = idx == 1;
+        for layer in gl_state.layers.borrow().iter() {
+            for idx in 0..3 {
+                let vb = &layer.vb.borrow()[idx];
+                let (vertex_count, index_count) = vb.vertex_index_count();
+                if vertex_count > 0 {
+                    let vertices = vb.current_vb();
+                    let subpixel_aa = idx == 1;
 
-                frame.draw(
-                    vertices.slice(0..vertex_count).unwrap(),
-                    vb.indices.slice(0..index_count).unwrap(),
-                    &gl_state.glyph_prog,
-                    &uniform! {
-                        projection: projection,
-                        atlas_nearest_sampler:  atlas_nearest_sampler,
-                        atlas_linear_sampler:  atlas_linear_sampler,
-                        foreground_text_hsb: foreground_text_hsb,
-                        subpixel_aa: subpixel_aa,
-                    },
-                    if subpixel_aa {
-                        &dual_source_blending
-                    } else {
-                        &alpha_blending
-                    },
-                )?;
+                    frame.draw(
+                        vertices.slice(0..vertex_count).unwrap(),
+                        vb.indices.slice(0..index_count).unwrap(),
+                        &gl_state.glyph_prog,
+                        &uniform! {
+                            projection: projection,
+                            atlas_nearest_sampler:  atlas_nearest_sampler,
+                            atlas_linear_sampler:  atlas_linear_sampler,
+                            foreground_text_hsb: foreground_text_hsb,
+                            subpixel_aa: subpixel_aa,
+                        },
+                        if subpixel_aa {
+                            &dual_source_blending
+                        } else {
+                            &alpha_blending
+                        },
+                    )?;
+                }
+
+                vb.next_index();
             }
-
-            vb.next_index();
         }
 
         Ok(())
@@ -1544,7 +1537,8 @@ impl super::TermWindow {
         pane: &Rc<dyn Pane>,
     ) -> anyhow::Result<()> {
         let gl_state = self.render_state.as_ref().unwrap();
-        let vb = &gl_state.vb[2];
+        let layer = gl_state.layer_for_zindex(0)?;
+        let vb = &layer.vb.borrow()[2];
         let mut vb_mut = vb.current_vb_mut();
         let mut quads = vb.map(&mut vb_mut);
         let palette = pane.palette();
@@ -1611,8 +1605,8 @@ impl super::TermWindow {
     pub fn paint_opengl_pass(&mut self) -> anyhow::Result<()> {
         {
             let gl_state = self.render_state.as_ref().unwrap();
-            for vb in &gl_state.vb {
-                vb.clear_quad_allocation();
+            for layer in gl_state.layers.borrow().iter() {
+                layer.clear_quad_allocation();
             }
         }
 
@@ -1622,10 +1616,64 @@ impl super::TermWindow {
         let panes = self.get_panes_to_render();
         let num_panes = panes.len();
         let focused = self.focused.is_some();
+        let window_is_transparent =
+            !self.window_background.is_empty() || self.config.window_background_opacity != 1.0;
+
+        // Render the full window background
+        match (self.window_background.is_empty(), self.allow_images) {
+            (false, true) => {
+                let bg_color = self.palette().background.to_linear();
+
+                let top = panes
+                    .iter()
+                    .find(|p| p.is_active)
+                    .map(|p| match self.get_viewport(p.pane.pane_id()) {
+                        Some(top) => top,
+                        None => p.pane.get_dimensions().physical_top,
+                    })
+                    .unwrap_or(0);
+
+                self.render_backgrounds(bg_color, top)?;
+            }
+            _ if window_is_transparent && panes.len() > 1 => {
+                // Avoid doubling up the background color: the panes
+                // will render out through the padding so there
+                // should be no gaps that need filling in
+            }
+            _ => {
+                // Regular window background color
+                let background = if panes.len() == 1 {
+                    // If we're the only pane, use the pane's palette
+                    // to draw the padding background
+                    panes[0].pane.palette().background
+                } else {
+                    self.palette().background
+                }
+                .to_linear()
+                .mul_alpha(self.config.window_background_opacity);
+
+                let gl_state = self.render_state.as_ref().unwrap();
+                let render_layer = gl_state.layer_for_zindex(0)?;
+                let vbs = render_layer.vb.borrow();
+                let mut vb_mut0 = vbs[0].current_vb_mut();
+                let mut layer0 = vbs[0].map(&mut vb_mut0);
+
+                self.filled_rectangle(
+                    &mut layer0,
+                    euclid::rect(
+                        0.,
+                        0.,
+                        self.dimensions.pixel_width as f32,
+                        self.dimensions.pixel_height as f32,
+                    ),
+                    background,
+                )?;
+            }
+        }
 
         for pos in panes {
             if pos.is_active {
-                self.update_text_cursor(&pos.pane);
+                self.update_text_cursor(&pos);
                 if focused {
                     pos.pane.advise_focus();
                     mux::Mux::get()
@@ -1647,6 +1695,7 @@ impl super::TermWindow {
             self.paint_tab_bar()?;
         }
 
+        self.paint_modal()?;
         self.paint_window_borders()?;
 
         Ok(())
@@ -2045,10 +2094,11 @@ impl super::TermWindow {
             };
 
             let ComputeCellFgBgResult {
-                fg_color: _glyph_color,
-                bg_color: _bg_color,
                 cursor_shape,
                 cursor_border_color,
+                cursor_border_color_alt,
+                cursor_border_mix,
+                ..
             } = self.compute_cell_fg_bg(ComputeCellFgBgParams {
                 cursor: Some(params.cursor),
                 selected: false,
@@ -2093,6 +2143,7 @@ impl super::TermWindow {
                 );
 
                 quad.set_fg_color(cursor_border_color);
+                quad.set_alt_color_and_mix_value(cursor_border_color_alt, cursor_border_mix);
             }
         }
 
@@ -2272,8 +2323,9 @@ impl super::TermWindow {
                             let ComputeCellFgBgResult {
                                 fg_color: glyph_color,
                                 bg_color,
-                                cursor_shape: _,
-                                cursor_border_color: _,
+                                fg_color_alt,
+                                fg_color_mix,
+                                ..
                             } = self.compute_cell_fg_bg(ComputeCellFgBgParams {
                                 cursor: if is_cursor { Some(params.cursor) } else { None },
                                 selected,
@@ -2314,6 +2366,7 @@ impl super::TermWindow {
                                 pos_y + top + texture.coords.size.height as f32 * height_scale,
                             );
                             quad.set_fg_color(glyph_color);
+                            quad.set_alt_color_and_mix_value(fg_color_alt, fg_color_mix);
                             quad.set_texture(texture_rect);
                             quad.set_hsv(if glyph.brightness_adjust != 1.0 {
                                 let hsv = hsv.unwrap_or_else(|| HsbTransform::default());
@@ -2490,7 +2543,7 @@ impl super::TermWindow {
 
     pub fn compute_cell_fg_bg(&self, params: ComputeCellFgBgParams) -> ComputeCellFgBgResult {
         if params.cursor.is_some() {
-            if let Some(intensity) = self.get_intensity_if_bell_target_ringing(
+            if let Some(bg_color_mix) = self.get_intensity_if_bell_target_ringing(
                 params.pane.expect("cursor only set if pane present"),
                 params.config,
                 VisualBellTarget::CursorColor,
@@ -2504,26 +2557,24 @@ impl super::TermWindow {
 
                 // interpolate between the background color
                 // and the the target color
-                let (r1, g1, b1, a) = bg_color.tuple();
-                let (r, g, b, _) = params
+                let bg_color_alt = params
                     .config
                     .resolved_palette
                     .visual_bell
-                    .map(|c| c.to_linear().tuple())
-                    .unwrap_or_else(|| fg_color.tuple());
-
-                let bg_color = LinearRgba::with_components(
-                    r1 + (r - r1) * intensity,
-                    g1 + (g - g1) * intensity,
-                    b1 + (b - b1) * intensity,
-                    a,
-                );
+                    .map(|c| c.to_linear())
+                    .unwrap_or(fg_color);
 
                 return ComputeCellFgBgResult {
                     fg_color,
+                    fg_color_alt: fg_color,
+                    fg_color_mix: 0.,
                     bg_color,
+                    bg_color_alt,
+                    bg_color_mix,
                     cursor_shape: Some(CursorShape::Default),
                     cursor_border_color: bg_color,
+                    cursor_border_color_alt: bg_color_alt,
+                    cursor_border_mix: bg_color_mix,
                 };
             }
 
@@ -2547,9 +2598,15 @@ impl super::TermWindow {
 
                 return ComputeCellFgBgResult {
                     fg_color,
+                    fg_color_alt: fg_color,
+                    fg_color_mix: 0.,
                     bg_color,
+                    bg_color_alt: bg_color,
+                    bg_color_mix: 0.,
                     cursor_shape: Some(CursorShape::Default),
                     cursor_border_color: color,
+                    cursor_border_color_alt: color,
+                    cursor_border_mix: 0.,
                 };
             }
         }
@@ -2567,7 +2624,7 @@ impl super::TermWindow {
 
         let focused_and_active = self.focused.is_some() && params.is_active_pane;
 
-        let (mut fg_color, bg_color, mut cursor_bg) = match (
+        let (fg_color, bg_color, cursor_bg) = match (
             params.selected,
             focused_and_active,
             cursor_shape,
@@ -2617,36 +2674,27 @@ impl super::TermWindow {
             && params.config.cursor_blink_rate != 0
             && self.focused.is_some();
 
+        let mut fg_color_alt = fg_color;
+        let bg_color_alt = bg_color;
+        let mut fg_color_mix = 0.;
+        let bg_color_mix = 0.;
+        let mut cursor_border_color_alt = cursor_bg;
+        let mut cursor_border_mix = 0.;
+
         if blinking {
             let mut color_ease = self.cursor_blink_state.borrow_mut();
             color_ease.update_start(self.prev_cursor.last_cursor_movement());
             let (intensity, next) = color_ease.intensity_continuous();
 
-            // Invert the intensity: we want to start with a visible
-            // cursor whenever the cursor moves, then fade out, then back.
-            let bg_intensity = 1.0 - intensity;
-
-            let (r1, g1, b1, a) = params.bg_color.tuple();
-            let (r, g, b, _a) = cursor_bg.tuple();
-            cursor_bg = LinearRgba::with_components(
-                r1 + (r - r1) * bg_intensity,
-                g1 + (g - g1) * bg_intensity,
-                b1 + (b - b1) * bg_intensity,
-                a,
-            );
+            cursor_border_mix = intensity;
+            cursor_border_color_alt = params.bg_color;
 
             if matches!(
                 cursor_shape,
                 CursorShape::BlinkingBlock | CursorShape::SteadyBlock,
             ) {
-                let (r1, g1, b1, a) = fg_color.tuple();
-                let (r, g, b, _a) = params.fg_color.tuple();
-                fg_color = LinearRgba::with_components(
-                    r1 + (r - r1) * intensity,
-                    g1 + (g - g1) * intensity,
-                    b1 + (b - b1) * intensity,
-                    a,
-                );
+                fg_color_alt = params.fg_color;
+                fg_color_mix = intensity;
             }
 
             self.update_next_frame_time(Some(next));
@@ -2654,8 +2702,14 @@ impl super::TermWindow {
 
         ComputeCellFgBgResult {
             fg_color,
+            fg_color_alt,
             bg_color,
+            bg_color_alt,
+            fg_color_mix,
+            bg_color_mix,
             cursor_border_color: cursor_bg,
+            cursor_border_color_alt,
+            cursor_border_mix,
             cursor_shape: if visibility == CursorVisibility::Visible {
                 match cursor_shape {
                     CursorShape::BlinkingBlock | CursorShape::SteadyBlock if focused_and_active => {

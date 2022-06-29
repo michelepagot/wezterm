@@ -1,3 +1,4 @@
+use clap::*;
 use config::configuration;
 use mux::activity::Activity;
 use mux::domain::{Domain, LocalDomain};
@@ -8,33 +9,33 @@ use std::process::Command;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::thread;
-use structopt::*;
 use wezterm_gui_subcommands::*;
 
 mod daemonize;
 
-#[derive(Debug, StructOpt)]
-#[structopt(
+#[derive(Debug, Parser)]
+#[clap(
     about = "Wez's Terminal Emulator\nhttp://github.com/wez/wezterm",
-    global_setting = structopt::clap::AppSettings::ColoredHelp,
-    version = config::wezterm_version()
+    version = config::wezterm_version(),
+    trailing_var_arg = true,
 )]
 struct Opt {
     /// Skip loading wezterm.lua
-    #[structopt(name = "skip-config", short = "n")]
+    #[clap(name = "skip-config", short = 'n')]
     skip_config: bool,
 
     /// Specify the configuration file to use, overrides the normal
     /// configuration file resolution
-    #[structopt(
+    #[clap(
         long = "config-file",
         parse(from_os_str),
-        conflicts_with = "skip-config"
+        conflicts_with = "skip-config",
+        value_hint=ValueHint::FilePath,
     )]
     config_file: Option<OsString>,
 
     /// Override specific configuration values
-    #[structopt(
+    #[clap(
         long = "config",
         name = "name=value",
         parse(try_from_str = name_equals_value),
@@ -42,18 +43,18 @@ struct Opt {
     config_override: Vec<(String, String)>,
 
     /// Detach from the foreground and become a background process
-    #[structopt(long = "daemonize")]
+    #[clap(long = "daemonize")]
     daemonize: bool,
 
     /// Specify the current working directory for the initially
     /// spawned program
-    #[structopt(long = "cwd", parse(from_os_str))]
+    #[clap(long = "cwd", parse(from_os_str), value_hint=ValueHint::DirPath)]
     cwd: Option<OsString>,
 
     /// Instead of executing your shell, run PROG.
     /// For example: `wezterm start -- bash -l` will spawn bash
     /// as if it were a login shell.
-    #[structopt(parse(from_os_str))]
+    #[clap(parse(from_os_str), value_hint=ValueHint::CommandWithArguments, multiple_values=true)]
     prog: Vec<OsString>,
 }
 
@@ -71,12 +72,12 @@ fn run() -> anyhow::Result<()> {
     config::designate_this_as_the_main_thread();
     let _saver = umask::UmaskSaver::new();
 
-    let opts = Opt::from_args();
+    let opts = Opt::parse();
     config::common_init(
         opts.config_file.as_ref(),
         &opts.config_override,
         opts.skip_config,
-    );
+    )?;
 
     let config = config::configuration();
     #[cfg(unix)]
@@ -200,18 +201,42 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
+async fn trigger_mux_startup(lua: Option<Rc<mlua::Lua>>) -> anyhow::Result<()> {
+    if let Some(lua) = lua {
+        let args = lua.pack_multi(())?;
+        config::lua::emit_event(&lua, ("mux-startup".to_string(), args)).await?;
+    }
+    Ok(())
+}
+
 async fn async_run(cmd: Option<CommandBuilder>) -> anyhow::Result<()> {
     let mux = Mux::get().unwrap();
 
     let domain = mux.default_domain();
-    let window_id = mux.new_empty_window(None);
-    domain.attach(Some(*window_id)).await?;
 
-    let config = config::configuration();
-    let _tab = mux
-        .default_domain()
-        .spawn(config.initial_size(), cmd, None, *window_id)
-        .await?;
+    {
+        if let Err(err) =
+            config::with_lua_config_on_main_thread(move |lua| trigger_mux_startup(lua)).await
+        {
+            log::error!("while processing mux-startup event: {:#}", err);
+        }
+    }
+
+    let have_panes_in_domain = mux
+        .iter_panes()
+        .iter()
+        .any(|p| p.domain_id() == domain.domain_id());
+
+    if !have_panes_in_domain {
+        let window_id = mux.new_empty_window(None);
+        domain.attach(Some(*window_id)).await?;
+
+        let config = config::configuration();
+        let _tab = mux
+            .default_domain()
+            .spawn(config.initial_size(0), cmd, None, *window_id)
+            .await?;
+    }
     Ok(())
 }
 
