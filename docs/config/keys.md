@@ -1,5 +1,7 @@
 ## Configuring Key Assignments
 
+[default-key](lua/config/[bold_brightens_ansi_colors](config/default-keys.md) is a static list of default key assignments.
+
 The default key table assignments can be overridden or extended using the
 `keys` section in your `~/.wezterm.lua` config file.  For example, you can
 disable a default assignment like this:
